@@ -44,7 +44,7 @@ typedef struct {
 
 typedef struct {
   GtkWidget *box, *bar_area;   // bar pill: a mini layout drawing (active highlighted)
-  guint poll_id;               // refresh the mini layout on hotplug
+  WbReader *watcher;           // IPC watch stream → instant active-highlight updates
   WbPop pop;
   char *icon_dir; int icon_size;
   char *monitors_kdl;
@@ -97,15 +97,11 @@ static void mons_clear(Inst *self) {
   g_array_set_size(self->mons, 0);
 }
 
-static void read_all(Inst *self) {
+static void update_bar(Inst *self);   // fwd
+
+static void parse_monitors(Inst *self, JsonArray *arr) {
   mons_clear(self);
-  char *out = amsg_out("get all-monitors");
-  if (!out) return;
-  JsonParser *p = json_parser_new();
-  if (json_parser_load_from_data(p, out, -1, NULL)) {
-    JsonNode *root = json_parser_get_root(p);
-    JsonArray *arr = JSON_NODE_HOLDS_ARRAY(root) ? json_node_get_array(root)
-        : json_object_get_array_member(json_node_get_object(root), "monitors");
+  {
     guint n = arr ? json_array_get_length(arr) : 0;
     for (guint i = 0; i < n; i++) {
       JsonObject *o = json_array_get_object_element(arr, i);
@@ -143,9 +139,37 @@ static void read_all(Inst *self) {
       g_array_append_val(self->mons, m);
     }
   }
+  if (self->sel >= (int)self->mons->len) self->sel = 0;
+}
+
+static void read_all(Inst *self) {
+  char *out = amsg_out("get all-monitors");
+  if (!out) return;
+  JsonParser *p = json_parser_new();
+  if (json_parser_load_from_data(p, out, -1, NULL)) {
+    JsonNode *root = json_parser_get_root(p);
+    JsonArray *arr = JSON_NODE_HOLDS_ARRAY(root) ? json_node_get_array(root)
+        : json_object_get_array_member(json_node_get_object(root), "monitors");
+    parse_monitors(self, arr);
+  }
   g_object_unref(p);
   g_free(out);
-  if (self->sel >= (int)self->mons->len) self->sel = 0;
+}
+
+// IPC watch stream: pushes the full all-monitors JSON on any change (focus,
+// hotplug), so the mini layout's active highlight updates instantly. Skipped
+// while the popup is open so it doesn't rebuild mons under the live widgets.
+static void on_watch_line(const char *line, gpointer d) {
+  Inst *self = d;
+  if (!line || !line[0] || wbpop_visible(&self->pop)) return;
+  JsonParser *p = json_parser_new();
+  if (json_parser_load_from_data(p, line, -1, NULL)) {
+    JsonNode *root = json_parser_get_root(p);
+    JsonArray *arr = JSON_NODE_HOLDS_ARRAY(root) ? json_node_get_array(root)
+        : json_object_get_array_member(json_node_get_object(root), "monitors");
+    if (arr) { parse_monitors(self, arr); update_bar(self); }
+  }
+  g_object_unref(p);
 }
 
 static Mon *cur_mon(Inst *self) {
@@ -639,14 +663,6 @@ static gboolean on_click(GtkWidget *w, GdkEventButton *ev, gpointer d) {
   return TRUE;
 }
 
-// Refresh the mini layout on monitor hotplug. Skip while the popup is open so
-// we don't rebuild the mons array under the live editing widgets.
-static gboolean poll_cb(gpointer d) {
-  Inst *self = d;
-  if (!wbpop_visible(&self->pop)) { read_all(self); update_bar(self); }
-  return G_SOURCE_CONTINUE;
-}
-
 void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entries, size_t entries_len) {
   Inst *self = g_new0(Inst, 1);
   self->icon_size = 24;
@@ -683,12 +699,13 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
 
   read_all(self);
   update_bar(self);
-  self->poll_id = g_timeout_add_seconds(4, poll_cb, self);
+  const char *wargv[] = {"amsg", "watch", "all-monitors", NULL};
+  self->watcher = wb_reader_start(wargv, on_watch_line, self, G_PRIORITY_DEFAULT);
   return self;
 }
 void wbcffi_deinit(void *instance) {
   Inst *self = instance;
-  if (self->poll_id) g_source_remove(self->poll_id);
+  wb_reader_free(self->watcher);
   wbpop_destroy(&self->pop);
   mons_clear(self);
   if (self->mons) g_array_free(self->mons, TRUE);
