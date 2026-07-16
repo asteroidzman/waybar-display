@@ -1,6 +1,13 @@
 # waybar-display
 
-A waybar CFFI plugin to configure the asteroidz compositor's active monitor.
+A waybar CFFI **settings** plugin for the asteroidz compositor — a tabbed popup:
+
+- **Display** — per-monitor resolution/refresh, scale, VRR, HDR + luminance,
+  and a draggable layout arranger (multi-monitor).
+- **Wallpaper** — a thumbnail browser plus cycle settings: source folder, cycle
+  interval, order (random/sequential), and shared-vs-per-monitor wallpapers.
+  Reads/writes ~/.config/waybar/wallpaper.conf and applies via the
+  set-wallpaper.sh / cycle-wallpaper.sh scripts (swaybg per-output + matugen).
 
 Bar pill: monitor icon + current resolution·refresh. Click for a popup to set:
 

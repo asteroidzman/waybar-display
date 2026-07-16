@@ -57,6 +57,10 @@ typedef struct {
   int loading;
   int drag;                // dragging a monitor on the canvas?
   int drag_ox, drag_oy;    // grab offset within the monitor (real coords)
+
+  int tab;                 // 0 = Display, 1 = Wallpaper
+  char *wp_conf;           // ~/.config/waybar/wallpaper.conf
+  GtkWidget *w_wpfolder, *w_wpinterval, *w_wporder, *w_wpmode, *w_wpmon, *w_wpflow;
 } Inst;
 
 // ─── amsg ────────────────────────────────────────────────────────────────────
@@ -559,17 +563,89 @@ static void head(GtkWidget *v, const char *txt) {
   gtk_box_pack_start(GTK_BOX(v), h, FALSE, FALSE, 0);
 }
 
-static void rebuild_popover(Inst *self) {
-  read_all(self);
-  GtkWidget *old = gtk_bin_get_child(GTK_BIN(self->pop.win));
-  if (old) gtk_widget_destroy(old);
-  self->loading = 1;
-  GtkWidget *v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-  gtk_style_context_add_class(gtk_widget_get_style_context(v), "dp-pop");
-  gtk_widget_set_margin_start(v, 18); gtk_widget_set_margin_end(v, 18);
-  gtk_widget_set_margin_top(v, 16); gtk_widget_set_margin_bottom(v, 16);
-  gtk_widget_set_size_request(v, 460, -1);
+// ─── wallpaper.conf key=value helpers ────────────────────────────────────────
+static char *wp_get(Inst *self, const char *key) {
+  char *data = NULL, *ret = NULL;
+  if (!g_file_get_contents(self->wp_conf, &data, NULL, NULL)) return NULL;
+  char **lines = g_strsplit(data, "\n", -1);
+  size_t kl = strlen(key);
+  for (int i = 0; lines[i]; i++)
+    if (!strncmp(lines[i], key, kl) && lines[i][kl] == '=') { ret = g_strdup(lines[i] + kl + 1); break; }
+  g_strfreev(lines); g_free(data);
+  return ret;
+}
+static void wp_set(Inst *self, const char *key, const char *val) {
+  char *data = NULL;
+  GString *s = g_string_new(NULL);
+  size_t kl = strlen(key);
+  int done = 0;
+  if (g_file_get_contents(self->wp_conf, &data, NULL, NULL)) {
+    char **lines = g_strsplit(data, "\n", -1);
+    for (int i = 0; lines[i]; i++) {
+      if (lines[i][0] == '\0') continue;   // drop blanks (incl. trailing)
+      if (!strncmp(lines[i], key, kl) && lines[i][kl] == '=') {
+        g_string_append_printf(s, "%s=%s\n", key, val); done = 1;
+      } else g_string_append_printf(s, "%s\n", lines[i]);
+    }
+    g_strfreev(lines); g_free(data);
+  }
+  if (!done) g_string_append_printf(s, "%s=%s\n", key, val);
+  g_file_set_contents(self->wp_conf, s->str, s->len, NULL);
+  g_string_free(s, TRUE);
+}
+// run set-wallpaper.sh [img [output]] to apply from the (just-written) config
+static void run_setwp(const char *img, const char *out) {
+  char *script = g_build_filename(g_get_home_dir(), ".config/waybar/scripts/set-wallpaper.sh", NULL);
+  const char *argv[5]; int n = 0;
+  argv[n++] = script;
+  if (img) argv[n++] = img;
+  if (out) argv[n++] = out;
+  argv[n] = NULL;
+  GSubprocess *sp = g_subprocess_newv(argv, G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+                                            G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL);
+  if (sp) g_object_unref(sp);
+  g_free(script);
+}
 
+// ─── wallpaper tab callbacks ─────────────────────────────────────────────────
+static void rebuild_popover(Inst *self);   // fwd
+static gboolean do_rebuild(gpointer d) { rebuild_popover(d); wbpop_refit(&((Inst *)d)->pop); return G_SOURCE_REMOVE; }
+
+static void on_wp_folder(GtkEntry *e, gpointer d) {
+  Inst *self = d; if (self->loading) return;
+  const char *f = gtk_entry_get_text(e);
+  if (f && *f) { wp_set(self, "folder", f); g_idle_add(do_rebuild, self); }   // reload thumbnails
+}
+static void on_wp_interval(GtkSpinButton *sp, gpointer d) {
+  Inst *self = d; if (self->loading) return;
+  char v[16]; g_snprintf(v, sizeof v, "%d", (int)lround(gtk_spin_button_get_value(sp)) * 60);
+  wp_set(self, "interval", v);   // shown in minutes, stored in seconds
+}
+static void on_wp_order(GtkComboBox *c, gpointer d) {
+  Inst *self = d; if (self->loading) return;
+  const char *o = gtk_combo_box_get_active_id(c); if (o) wp_set(self, "order", o);
+}
+static void on_wp_mode(GtkComboBox *c, gpointer d) {
+  Inst *self = d; if (self->loading) return;
+  const char *m = gtk_combo_box_get_active_id(c);
+  if (m) { wp_set(self, "mode", m); run_setwp(NULL, NULL); g_idle_add(do_rebuild, self); }
+}
+typedef struct { Inst *self; char path[1024]; } ThumbCtx;
+static void thumbctx_free(gpointer p, GClosure *c) { (void)c; g_free(p); }
+static void on_wp_thumb(GtkButton *b, gpointer d) {
+  (void)b; ThumbCtx *t = d; Inst *self = t->self;
+  char *mode = wp_get(self, "mode");
+  if (mode && !strcmp(mode, "per-monitor") && self->w_wpmon) {
+    const char *out = gtk_combo_box_get_active_id(GTK_COMBO_BOX(self->w_wpmon));
+    run_setwp(t->path, out && *out ? out : NULL);
+  } else {
+    run_setwp(t->path, NULL);   // shared / main
+  }
+  g_free(mode);
+}
+
+// ─── Display tab (the monitor configuration) ─────────────────────────────────
+static void build_display_tab(Inst *self, GtkWidget *v) {
   head(v, "Displays");
   // ── layout canvas ──
   self->canvas = gtk_drawing_area_new();
@@ -645,14 +721,167 @@ static void rebuild_popover(Inst *self) {
   gtk_box_pack_start(GTK_BOX(v), ar, FALSE, FALSE, 0);
 
   g_object_set_data(G_OBJECT(self->pop.win), "wb-focus", apply);
-  gtk_container_add(GTK_CONTAINER(self->pop.win), v);
-  gtk_widget_show_all(v);
+}
+
+// ─── Wallpaper tab (browser + cycle settings) ────────────────────────────────
+static int is_image(const char *name) {
+  const char *dot = strrchr(name, '.');
+  if (!dot) return 0;
+  return !g_ascii_strcasecmp(dot, ".jpg") || !g_ascii_strcasecmp(dot, ".jpeg") ||
+         !g_ascii_strcasecmp(dot, ".png") || !g_ascii_strcasecmp(dot, ".webp");
+}
+static gint cmp_names(gconstpointer a, gconstpointer b) {
+  return g_ascii_strcasecmp(*(const char *const *)a, *(const char *const *)b);
+}
+static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
+  head(v, "Wallpaper");
+  char *folder = wp_get(self, "folder");
+  if (!folder) folder = g_build_filename(g_get_home_dir(), "Pictures", NULL);
+  char *order = wp_get(self, "order");
+  char *mode = wp_get(self, "mode");
+  char *ivs = wp_get(self, "interval");
+  int iv = ivs ? atoi(ivs) : 3600;
+
+  // folder
+  self->w_wpfolder = gtk_entry_new();
+  gtk_entry_set_text(GTK_ENTRY(self->w_wpfolder), folder);
+  gtk_widget_set_hexpand(self->w_wpfolder, TRUE);
+  g_signal_connect(self->w_wpfolder, "activate", G_CALLBACK(on_wp_folder), self);
+  row(v, "Folder", self->w_wpfolder);
+
+  // cycle interval (minutes; 0 = off)
+  self->w_wpinterval = gtk_spin_button_new_with_range(0, 1440, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_wpinterval), iv / 60);
+  g_signal_connect(self->w_wpinterval, "value-changed", G_CALLBACK(on_wp_interval), self);
+  row(v, "Cycle every (min, 0=off)", self->w_wpinterval);
+
+  // order
+  self->w_wporder = gtk_combo_box_text_new();
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wporder), "random", "Random");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wporder), "sequential", "Sequential");
+  gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_wporder), order ? order : "random");
+  g_signal_connect(self->w_wporder, "changed", G_CALLBACK(on_wp_order), self);
+  row(v, "Order", self->w_wporder);
+
+  // mode
+  self->w_wpmode = gtk_combo_box_text_new();
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wpmode), "shared", "Same on all monitors");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wpmode), "per-monitor", "Per monitor");
+  gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_wpmode), mode ? mode : "shared");
+  g_signal_connect(self->w_wpmode, "changed", G_CALLBACK(on_wp_mode), self);
+  row(v, "Mode", self->w_wpmode);
+
+  // per-monitor: which output the browser assigns to
+  self->w_wpmon = NULL;
+  if (mode && !strcmp(mode, "per-monitor")) {
+    self->w_wpmon = gtk_combo_box_text_new();
+    for (guint i = 0; i < self->mons->len; i++) {
+      Mon *m = &g_array_index(self->mons, Mon, i);
+      gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wpmon), m->name, m->name);
+    }
+    Mon *cm = cur_mon(self);
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_wpmon), cm ? cm->name : NULL);
+    row(v, "Set for monitor", self->w_wpmon);
+  }
+
+  gtk_box_pack_start(GTK_BOX(v), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
+
+  // thumbnail browser
+  GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+  gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                 GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_widget_set_size_request(scroll, -1, 260);
+  gtk_style_context_add_class(gtk_widget_get_style_context(scroll), "wp-browser");
+  self->w_wpflow = gtk_flow_box_new();
+  gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(self->w_wpflow), GTK_SELECTION_NONE);
+  gtk_flow_box_set_homogeneous(GTK_FLOW_BOX(self->w_wpflow), TRUE);
+  gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(self->w_wpflow), 3);
+  gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(self->w_wpflow), 3);
+  gtk_container_add(GTK_CONTAINER(scroll), self->w_wpflow);
+  gtk_box_pack_start(GTK_BOX(v), scroll, TRUE, TRUE, 0);
+
+  char *curwp = wp_get(self, "wallpaper");
+  GDir *d = g_dir_open(folder, 0, NULL);
+  int count = 0;
+  if (d) {
+    GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+    const char *nm;
+    while ((nm = g_dir_read_name(d))) if (is_image(nm)) g_ptr_array_add(names, g_strdup(nm));
+    g_dir_close(d);
+    g_ptr_array_sort(names, cmp_names);
+    for (guint i = 0; i < names->len && count < 200; i++) {
+      char *path = g_build_filename(folder, g_ptr_array_index(names, i), NULL);
+      GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_scale(path, 132, 74, TRUE, NULL);
+      if (!pb) { g_free(path); continue; }
+      GtkWidget *img = gtk_image_new_from_pixbuf(pb); g_object_unref(pb);
+      GtkWidget *btn = gtk_button_new();
+      gtk_button_set_image(GTK_BUTTON(btn), img);
+      gtk_style_context_add_class(gtk_widget_get_style_context(btn), "wp-thumb");
+      if (curwp && !strcmp(curwp, path))
+        gtk_style_context_add_class(gtk_widget_get_style_context(btn), "wp-current");
+      ThumbCtx *t = g_new0(ThumbCtx, 1); t->self = self; g_strlcpy(t->path, path, sizeof t->path);
+      g_signal_connect_data(btn, "clicked", G_CALLBACK(on_wp_thumb), t, thumbctx_free, 0);
+      gtk_flow_box_insert(GTK_FLOW_BOX(self->w_wpflow), btn, -1);
+      g_free(path);
+      count++;
+    }
+    g_ptr_array_free(names, TRUE);
+  }
+  if (!count) {
+    GtkWidget *e = gtk_label_new("No images in this folder");
+    gtk_style_context_add_class(gtk_widget_get_style_context(e), "dp-status");
+    gtk_container_add(GTK_CONTAINER(self->w_wpflow), e);
+  }
+  g_free(curwp); g_free(folder); g_free(order); g_free(mode); g_free(ivs);
+}
+
+// ─── tab bar + dispatch ──────────────────────────────────────────────────────
+static void on_tab_clicked(GtkButton *b, gpointer d) {
+  Inst *self = d;
+  int t = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "tab"));
+  if (t != self->tab) { self->tab = t; g_idle_add(do_rebuild, self); }
+}
+static void rebuild_popover(Inst *self) {
+  read_all(self);
+  GtkWidget *old = gtk_bin_get_child(GTK_BIN(self->pop.win));
+  if (old) gtk_widget_destroy(old);
+  self->loading = 1;
+  GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_style_context_add_class(gtk_widget_get_style_context(outer), "dp-pop");
+  gtk_widget_set_margin_start(outer, 18); gtk_widget_set_margin_end(outer, 18);
+  gtk_widget_set_margin_top(outer, 14); gtk_widget_set_margin_bottom(outer, 16);
+
+  // tab bar
+  GtkWidget *tabs = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_style_context_add_class(gtk_widget_get_style_context(tabs), "dp-tabs");
+  const char *names[] = {"Display", "Wallpaper"};
+  for (int i = 0; i < 2; i++) {
+    GtkWidget *tb = gtk_button_new_with_label(names[i]);
+    gtk_widget_set_hexpand(tb, TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(tb), "dp-tab");
+    if (i == self->tab) gtk_style_context_add_class(gtk_widget_get_style_context(tb), "dp-tab-active");
+    g_object_set_data(G_OBJECT(tb), "tab", GINT_TO_POINTER(i));
+    g_signal_connect(tb, "clicked", G_CALLBACK(on_tab_clicked), self);
+    gtk_box_pack_start(GTK_BOX(tabs), tb, TRUE, TRUE, 0);
+  }
+  gtk_box_pack_start(GTK_BOX(outer), tabs, FALSE, FALSE, 0);
+
+  // content
+  GtkWidget *v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_size_request(v, 460, -1);
+  if (self->tab == 1) build_wallpaper_tab(self, v);
+  else build_display_tab(self, v);
+  gtk_box_pack_start(GTK_BOX(outer), v, TRUE, TRUE, 0);
+
+  gtk_container_add(GTK_CONTAINER(self->pop.win), outer);
+  gtk_widget_show_all(outer);
   self->loading = 0;
-  // default selection: the active monitor
-  int def = 0;
-  for (guint i = 0; i < self->mons->len; i++)
-    if (g_array_index(self->mons, Mon, i).active) { def = i; break; }
-  select_mon(self, def);
+  if (self->tab == 0) {
+    int def = 0;
+    for (guint i = 0; i < self->mons->len; i++)
+      if (g_array_index(self->mons, Mon, i).active) { def = i; break; }
+    select_mon(self, def);
+  }
 }
 static void rebuild_cb(gpointer user) { rebuild_popover(user); }
 
@@ -678,6 +907,7 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
   }
   if (!self->monitors_kdl)
     self->monitors_kdl = g_build_filename(g_get_home_dir(), ".config/asteroidz/monitors.kdl", NULL);
+  self->wp_conf = g_build_filename(g_get_home_dir(), ".config/waybar/wallpaper.conf", NULL);
 
   GtkContainer *root = info->get_root_widget(info->obj);
   self->box = gtk_event_box_new();
@@ -711,5 +941,6 @@ void wbcffi_deinit(void *instance) {
   if (self->mons) g_array_free(self->mons, TRUE);
   g_free(self->icon_dir);
   g_free(self->monitors_kdl);
+  g_free(self->wp_conf);
   g_free(self);
 }
