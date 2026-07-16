@@ -1,14 +1,16 @@
-// waybar CFFI plugin: asteroidz display/monitor configuration.
-//  - Bar pill: monitor icon + current resolution·refresh of the active output.
-//  - Click opens a popup to configure that output: resolution + refresh, scale,
-//    VRR, HDR (instant), SDR reference luminance (instant), and HDR tone-map
-//    luminances (max/min/max-fall).
-//  - State comes from `amsg get all-monitors` / `get monitor <name>` (the modes
-//    array was added to asteroidz's IPC for the resolution picker). HDR toggle
-//    and SDR luminance apply live via `amsg dispatch`; resolution/scale/VRR and
-//    the HDR luminances are written to a plugin-owned monitors.kdl (sourced by
-//    config.kdl) and applied with `amsg dispatch reload_config`, which
-//    re-modesets the live output.
+// waybar CFFI plugin: asteroidz display/monitor configuration (multi-monitor).
+//  - Bar pill: monitor icon + active output's resolution·refresh.
+//  - Click opens a popup with:
+//      * a draggable layout canvas — arrange the monitors' positions (snaps to
+//        neighbouring edges); click a monitor to select it,
+//      * per-monitor controls for the selected output: resolution + refresh,
+//        scale, VRR, HDR, HDR max/min/max-fall luminances, X/Y position,
+//      * a global SDR reference-luminance slider (applied live).
+//  - State from `amsg get all-monitors` (per-monitor incl. the modes array and
+//    logical x/y). HDR toggle + SDR luminance apply live via `amsg dispatch`.
+//    Resolution/scale/VRR/HDR-luminance/position are written to the plugin-owned
+//    monitors.kdl (one `output` block per monitor, sourced by config.kdl) and
+//    applied with `reload_config`, which re-modesets + re-lays-out live.
 #define _GNU_SOURCE
 #include <gtk/gtk.h>
 #include <gio/gio.h>
@@ -25,37 +27,44 @@ const size_t wbcffi_version = 1;
 typedef struct { int w, h, refresh_mhz; } Mode;
 
 typedef struct {
-  GtkWidget *box, *icon, *label;
-  WbPop pop;
-  char *icon_dir; int icon_size;
-  char *monitors_kdl;      // plugin-owned output config (sourced by config.kdl)
-  char output_name[64];
-
-  // current state (read from the compositor)
+  char name[64];
+  int active;
+  int lx, ly, lw, lh;      // logical rect (position + size) reported now
   int cur_w, cur_h, cur_refresh_mhz;
   double scale;
   int hdr, hdr_capable, vrr, vrr_capable;
-  int sdr_lum;
   double hdr_max, hdr_min, hdr_fall;
   int bitdepth;
   char icc[512];
   GArray *modes;           // Mode[]
+  // edited values (widgets / canvas write here; Apply serializes these)
+  int sel_w, sel_h, sel_mhz, sel_x, sel_y, sel_vrr, sel_hdr;
+  double sel_scale, sel_hmax, sel_hmin, sel_hfall;
+} Mon;
 
-  // popup widgets (valid only while the popup is open)
-  GtkWidget *w_res, *w_refresh, *w_scale, *w_vrr, *w_hdr, *w_sdr,
-            *w_hmax, *w_hmin, *w_hfall, *w_status;
-  int loading;             // suppress change handlers during rebuild
+typedef struct {
+  GtkWidget *box, *icon, *label;
+  WbPop pop;
+  char *icon_dir; int icon_size;
+  char *monitors_kdl;
+  int sdr_lum;             // global reference luminance
+  GArray *mons;            // Mon[]
+  int sel;                 // selected monitor index
+
+  GtkWidget *canvas, *w_res, *w_refresh, *w_scale, *w_vrr, *w_hdr, *w_sdr,
+            *w_hmax, *w_hmin, *w_hfall, *w_posx, *w_posy, *w_status, *w_montitle;
+  int loading;
+  int drag;                // dragging a monitor on the canvas?
+  int drag_ox, drag_oy;    // grab offset within the monitor (real coords)
 } Inst;
 
-// ─── amsg helpers ────────────────────────────────────────────────────────────
-// amsg resolves the live IPC socket itself (env, else newest asteroidz-*.sock),
-// so a stale ASTEROIDZ_INSTANCE_SIGNATURE in waybar's env is fine.
+// ─── amsg ────────────────────────────────────────────────────────────────────
 static char *amsg_out(const char *args) {
   char *cmd = g_strdup_printf("amsg %s", args);
   char *out = NULL;
   g_spawn_command_line_sync(cmd, &out, NULL, NULL, NULL);
   g_free(cmd);
-  return out;   // caller frees; may be NULL
+  return out;
 }
 static void amsg_dispatch(const char *verb) {
   const char *argv[] = {"amsg", "dispatch", verb, NULL};
@@ -63,7 +72,6 @@ static void amsg_dispatch(const char *verb) {
                                             G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL);
   if (sp) g_object_unref(sp);
 }
-
 static int jint(JsonObject *o, const char *k, int def) {
   return json_object_has_member(o, k) ? (int)json_object_get_int_member(o, k) : def;
 }
@@ -79,116 +87,116 @@ static const char *jstr(JsonObject *o, const char *k) {
              ? json_object_get_string_member(o, k) : "";
 }
 
-// ─── read compositor state ───────────────────────────────────────────────────
-static void find_active_output(Inst *self) {
-  self->output_name[0] = '\0';
+static void mons_clear(Inst *self) {
+  if (!self->mons) { self->mons = g_array_new(FALSE, TRUE, sizeof(Mon)); return; }
+  for (guint i = 0; i < self->mons->len; i++) {
+    Mon *m = &g_array_index(self->mons, Mon, i);
+    if (m->modes) g_array_free(m->modes, TRUE);
+  }
+  g_array_set_size(self->mons, 0);
+}
+
+static void read_all(Inst *self) {
+  mons_clear(self);
   char *out = amsg_out("get all-monitors");
   if (!out) return;
   JsonParser *p = json_parser_new();
   if (json_parser_load_from_data(p, out, -1, NULL)) {
     JsonNode *root = json_parser_get_root(p);
-    JsonArray *arr = NULL;
-    if (JSON_NODE_HOLDS_ARRAY(root)) arr = json_node_get_array(root);
-    else if (JSON_NODE_HOLDS_OBJECT(root) &&
-             json_object_has_member(json_node_get_object(root), "monitors"))
-      arr = json_object_get_array_member(json_node_get_object(root), "monitors");
-    if (arr) {
-      guint n = json_array_get_length(arr);
-      for (guint i = 0; i < n; i++) {
-        JsonObject *m = json_array_get_object_element(arr, i);
-        if (!self->output_name[0])   // fallback: first monitor
-          g_strlcpy(self->output_name, jstr(m, "name"), sizeof self->output_name);
-        if (jbool(m, "active")) {
-          g_strlcpy(self->output_name, jstr(m, "name"), sizeof self->output_name);
-          break;
+    JsonArray *arr = JSON_NODE_HOLDS_ARRAY(root) ? json_node_get_array(root)
+        : json_object_get_array_member(json_node_get_object(root), "monitors");
+    guint n = arr ? json_array_get_length(arr) : 0;
+    for (guint i = 0; i < n; i++) {
+      JsonObject *o = json_array_get_object_element(arr, i);
+      Mon m; memset(&m, 0, sizeof m);
+      g_strlcpy(m.name, jstr(o, "name"), sizeof m.name);
+      m.active = jbool(o, "active");
+      m.lx = jint(o, "x", 0); m.ly = jint(o, "y", 0);
+      m.lw = jint(o, "width", 0); m.lh = jint(o, "height", 0);
+      m.cur_w = jint(o, "mode_width", 0);
+      m.cur_h = jint(o, "mode_height", 0);
+      m.cur_refresh_mhz = jint(o, "mode_refresh", 0);
+      m.scale = jdbl(o, "scale", 1.0);
+      m.hdr = jbool(o, "hdr_enabled"); m.hdr_capable = jbool(o, "hdr_capable");
+      m.vrr = jbool(o, "vrr_enabled"); m.vrr_capable = jbool(o, "vrr_capable");
+      m.hdr_max = jdbl(o, "hdr_max_luminance", 0);
+      m.hdr_min = jdbl(o, "hdr_min_luminance", 0);
+      m.hdr_fall = jdbl(o, "hdr_max_fall", 0);
+      m.bitdepth = jint(o, "bitdepth", 0);
+      g_strlcpy(m.icc, jstr(o, "icc_profile"), sizeof m.icc);
+      if (i == 0) self->sdr_lum = jint(o, "sdr_luminance", 203);
+      m.modes = g_array_new(FALSE, FALSE, sizeof(Mode));
+      if (json_object_has_member(o, "modes")) {
+        JsonArray *ms = json_object_get_array_member(o, "modes");
+        for (guint j = 0; j < json_array_get_length(ms); j++) {
+          JsonObject *mm = json_array_get_object_element(ms, j);
+          Mode md = { jint(mm, "width", 0), jint(mm, "height", 0), jint(mm, "refresh", 0) };
+          if (md.w > 0 && md.h > 0) g_array_append_val(m.modes, md);
         }
       }
+      // seed edits from current
+      m.sel_w = m.cur_w; m.sel_h = m.cur_h; m.sel_mhz = m.cur_refresh_mhz;
+      m.sel_x = m.lx; m.sel_y = m.ly; m.sel_scale = m.scale;
+      m.sel_vrr = m.vrr; m.sel_hdr = m.hdr;
+      m.sel_hmax = m.hdr_max; m.sel_hmin = m.hdr_min; m.sel_hfall = m.hdr_fall;
+      g_array_append_val(self->mons, m);
     }
   }
   g_object_unref(p);
   g_free(out);
+  if (self->sel >= (int)self->mons->len) self->sel = 0;
 }
 
-static void read_state(Inst *self) {
-  if (!self->output_name[0]) find_active_output(self);
-  if (!self->output_name[0]) return;
-  char *args = g_strdup_printf("get monitor %s", self->output_name);
-  char *out = amsg_out(args);
-  g_free(args);
-  if (!out) return;
-  JsonParser *p = json_parser_new();
-  if (json_parser_load_from_data(p, out, -1, NULL)) {
-    JsonObject *o = json_node_get_object(json_parser_get_root(p));
-    self->cur_w = jint(o, "mode_width", 0);
-    self->cur_h = jint(o, "mode_height", 0);
-    self->cur_refresh_mhz = jint(o, "mode_refresh", 0);
-    self->scale = jdbl(o, "scale", 1.0);
-    self->hdr = jbool(o, "hdr_enabled");
-    self->hdr_capable = jbool(o, "hdr_capable");
-    self->vrr = jbool(o, "vrr_enabled");
-    self->vrr_capable = jbool(o, "vrr_capable");
-    self->sdr_lum = jint(o, "sdr_luminance", 203);
-    self->hdr_max = jdbl(o, "hdr_max_luminance", 0);
-    self->hdr_min = jdbl(o, "hdr_min_luminance", 0);
-    self->hdr_fall = jdbl(o, "hdr_max_fall", 0);
-    self->bitdepth = jint(o, "bitdepth", 0);
-    g_strlcpy(self->icc, jstr(o, "icc_profile"), sizeof self->icc);
-    if (self->modes) g_array_set_size(self->modes, 0);
-    else self->modes = g_array_new(FALSE, FALSE, sizeof(Mode));
-    if (json_object_has_member(o, "modes")) {
-      JsonArray *ms = json_object_get_array_member(o, "modes");
-      guint n = json_array_get_length(ms);
-      for (guint i = 0; i < n; i++) {
-        JsonObject *m = json_array_get_object_element(ms, i);
-        Mode md = { jint(m, "width", 0), jint(m, "height", 0), jint(m, "refresh", 0) };
-        if (md.w > 0 && md.h > 0) g_array_append_val(self->modes, md);
-      }
-    }
-  }
-  g_object_unref(p);
-  g_free(out);
+static Mon *cur_mon(Inst *self) {
+  if (!self->mons || self->sel >= (int)self->mons->len) return NULL;
+  return &g_array_index(self->mons, Mon, self->sel);
 }
 
 // ─── bar pill ────────────────────────────────────────────────────────────────
 static void update_bar(Inst *self) {
   wb_icon_set(self->icon, "display.svg");
+  Mon *a = NULL;
+  for (guint i = 0; self->mons && i < self->mons->len; i++) {
+    Mon *m = &g_array_index(self->mons, Mon, i);
+    if (m->active) { a = m; break; }
+    if (!a) a = m;
+  }
   char t[48];
-  if (self->cur_w > 0)
-    g_snprintf(t, sizeof t, "%d·%dHz", self->cur_h,
-               (int)lround(self->cur_refresh_mhz / 1000.0));
-  else
-    g_snprintf(t, sizeof t, "display");
+  if (a && a->cur_w > 0)
+    g_snprintf(t, sizeof t, "%d·%dHz", a->cur_h, (int)lround(a->cur_refresh_mhz / 1000.0));
+  else g_snprintf(t, sizeof t, "display");
   gtk_label_set_text(GTK_LABEL(self->label), t);
 }
 
-// ─── monitors.kdl writer ─────────────────────────────────────────────────────
+// ─── monitors.kdl writer (all monitors) ──────────────────────────────────────
 static void fmt_refresh(int mhz, char *buf, size_t n) {
   double hz = mhz / 1000.0;
   if (fabs(hz - lround(hz)) < 0.05) g_snprintf(buf, n, "%ld", lround(hz));
   else g_snprintf(buf, n, "%.3f", hz);
 }
-static void write_monitors_kdl(Inst *self, int sel_w, int sel_h, int sel_mhz,
-                               double sel_scale, int sel_vrr, int sel_hdr,
-                               double hmax, double hmin, double hfall) {
+static void write_monitors_kdl(Inst *self) {
   GString *s = g_string_new(
       "// Managed by the waybar-display plugin — rewritten on each change.\n"
-      "// Fields map to the asteroidz `output` block; reload_config applies live.\n");
-  g_string_append_printf(s, "output %s {", self->output_name);
-  if (sel_hdr) g_string_append(s, " hdr;");
-  g_string_append_printf(s, " scale %.4g;", sel_scale);
-  if (sel_w > 0 && sel_h > 0) {
-    char rb[32]; fmt_refresh(sel_mhz, rb, sizeof rb);
-    g_string_append_printf(s, " width %d; height %d; refresh %s;", sel_w, sel_h, rb);
+      "// One `output` block per monitor; reload_config applies live.\n");
+  for (guint i = 0; i < self->mons->len; i++) {
+    Mon *m = &g_array_index(self->mons, Mon, i);
+    g_string_append_printf(s, "output %s {", m->name);
+    if (m->sel_hdr) g_string_append(s, " hdr;");
+    g_string_append_printf(s, " scale %.4g;", m->sel_scale);
+    if (m->sel_w > 0 && m->sel_h > 0) {
+      char rb[32]; fmt_refresh(m->sel_mhz, rb, sizeof rb);
+      g_string_append_printf(s, " width %d; height %d; refresh %s;", m->sel_w, m->sel_h, rb);
+    }
+    g_string_append_printf(s, " x %d; y %d; vrr %d;", m->sel_x, m->sel_y, m->sel_vrr ? 1 : 0);
+    if (m->sel_hdr) {
+      if (m->bitdepth > 0) g_string_append_printf(s, " bit-depth %d;", m->bitdepth);
+      if (m->sel_hmax > 0) g_string_append_printf(s, " max-luminance %.4g;", m->sel_hmax);
+      if (m->sel_hmin > 0) g_string_append_printf(s, " min-luminance %.4g;", m->sel_hmin);
+      if (m->sel_hfall > 0) g_string_append_printf(s, " max-fall %.4g;", m->sel_hfall);
+    }
+    if (m->icc[0]) g_string_append_printf(s, " icc-profile \"%s\";", m->icc);
+    g_string_append(s, " }\n");
   }
-  g_string_append_printf(s, " vrr %d;", sel_vrr ? 1 : 0);
-  if (sel_hdr) {
-    if (self->bitdepth > 0) g_string_append_printf(s, " bit-depth %d;", self->bitdepth);
-    if (hmax > 0) g_string_append_printf(s, " max-luminance %.4g;", hmax);
-    if (hmin > 0) g_string_append_printf(s, " min-luminance %.4g;", hmin);
-    if (hfall > 0) g_string_append_printf(s, " max-fall %.4g;", hfall);
-  }
-  if (self->icc[0]) g_string_append_printf(s, " icc-profile \"%s\";", self->icc);
-  g_string_append(s, " }\n");
   g_file_set_contents(self->monitors_kdl, s->str, s->len, NULL);
   g_string_free(s, TRUE);
 }
@@ -197,129 +205,253 @@ static void set_status(Inst *self, const char *msg) {
   if (self->w_status) gtk_label_set_text(GTK_LABEL(self->w_status), msg);
 }
 
-// ─── apply ───────────────────────────────────────────────────────────────────
-// selected mode from the two combos
-static int selected_mode(Inst *self, int *w, int *h, int *mhz) {
-  const char *rid = self->w_refresh ?
-      gtk_combo_box_get_active_id(GTK_COMBO_BOX(self->w_refresh)) : NULL;
-  if (!rid) return 0;
-  int i = atoi(rid);   // index into self->modes
-  if (i < 0 || (guint)i >= self->modes->len) return 0;
-  Mode m = g_array_index(self->modes, Mode, i);
-  *w = m.w; *h = m.h; *mhz = m.refresh_mhz;
-  return 1;
+// ─── layout canvas ───────────────────────────────────────────────────────────
+// effective logical rect of a monitor from its EDITED values (mode/scale),
+// falling back to reported logical size.
+static void mon_rect(Mon *m, int *x, int *y, int *w, int *h) {
+  *x = m->sel_x; *y = m->sel_y;
+  if (m->sel_w > 0 && m->sel_scale > 0.01) {
+    *w = (int)lround(m->sel_w / m->sel_scale);
+    *h = (int)lround(m->sel_h / m->sel_scale);
+  } else { *w = m->lw; *h = m->lh; }
+}
+// world→canvas transform: fit all monitors into the drawing area with margin
+static void canvas_xform(Inst *self, int cw, int ch, double *sc, int *ox, int *oy) {
+  int minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
+  for (guint i = 0; i < self->mons->len; i++) {
+    int x, y, w, h; mon_rect(&g_array_index(self->mons, Mon, i), &x, &y, &w, &h);
+    if (x < minx) minx = x;
+    if (y < miny) miny = y;
+    if (x + w > maxx) maxx = x + w;
+    if (y + h > maxy) maxy = y + h;
+  }
+  if (minx == INT32_MAX) { *sc = 0.05; *ox = 0; *oy = 0; return; }
+  double m = 16;   // canvas padding
+  double sx = (cw - 2 * m) / (double)(maxx - minx > 0 ? maxx - minx : 1);
+  double sy = (ch - 2 * m) / (double)(maxy - miny > 0 ? maxy - miny : 1);
+  double s = sx < sy ? sx : sy;
+  if (s > 0.12) s = 0.12;   // don't zoom in too far for a single small setup
+  *sc = s;
+  *ox = (int)(m - minx * s + (cw - 2 * m - (maxx - minx) * s) / 2);
+  *oy = (int)(m - miny * s + (ch - 2 * m - (maxy - miny) * s) / 2);
+}
+
+static gboolean canvas_draw(GtkWidget *wdg, cairo_t *cr, gpointer d) {
+  Inst *self = d;
+  int cw = gtk_widget_get_allocated_width(wdg), ch = gtk_widget_get_allocated_height(wdg);
+  GtkStyleContext *ctx = gtk_widget_get_style_context(wdg);
+  GdkRGBA accent;   // widget `color` = @primary (CSS): used for the selected fill
+  gtk_style_context_get_color(ctx, gtk_style_context_get_state(ctx), &accent);
+  GdkRGBA fg = { 0.86, 0.88, 0.93, 1.0 };   // neutral strokes/labels
+  if (!self->mons || !self->mons->len) return FALSE;
+  double s; int ox, oy; canvas_xform(self, cw, ch, &s, &ox, &oy);
+  for (guint i = 0; i < self->mons->len; i++) {
+    Mon *m = &g_array_index(self->mons, Mon, i);
+    int x, y, w, h; mon_rect(m, &x, &y, &w, &h);
+    double rx = ox + x * s, ry = oy + y * s, rw = w * s, rh = h * s;
+    int seld = ((int)i == self->sel);
+    // fill
+    if (seld) cairo_set_source_rgba(cr, accent.red, accent.green, accent.blue, 0.30);
+    else cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.10);
+    cairo_rectangle(cr, rx + 1, ry + 1, rw - 2, rh - 2);
+    cairo_fill(cr);
+    // border
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, seld ? 0.95 : 0.5);
+    cairo_set_line_width(cr, seld ? 2.5 : 1.5);
+    cairo_rectangle(cr, rx + 1, ry + 1, rw - 2, rh - 2);
+    cairo_stroke(cr);
+    // label
+    char lbl[80];
+    g_snprintf(lbl, sizeof lbl, "%s\n%d×%d", m->name, m->sel_w, m->sel_h);
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.95);
+    PangoLayout *pl = pango_cairo_create_layout(cr);
+    pango_layout_set_text(pl, lbl, -1);
+    pango_layout_set_alignment(pl, PANGO_ALIGN_CENTER);
+    int pw, ph; pango_layout_get_pixel_size(pl, &pw, &ph);
+    cairo_move_to(cr, rx + (rw - pw) / 2, ry + (rh - ph) / 2);
+    pango_cairo_show_layout(cr, pl);
+    g_object_unref(pl);
+  }
+  return FALSE;
+}
+
+static int mon_at(Inst *self, double px, double py) {
+  int cw = gtk_widget_get_allocated_width(self->canvas), ch = gtk_widget_get_allocated_height(self->canvas);
+  double s; int ox, oy; canvas_xform(self, cw, ch, &s, &ox, &oy);
+  for (int i = (int)self->mons->len - 1; i >= 0; i--) {
+    int x, y, w, h; mon_rect(&g_array_index(self->mons, Mon, i), &x, &y, &w, &h);
+    double rx = ox + x * s, ry = oy + y * s;
+    if (px >= rx && px <= rx + w * s && py >= ry && py <= ry + h * s) return i;
+  }
+  return -1;
+}
+
+static void select_mon(Inst *self, int idx);   // fwd
+
+static gboolean canvas_press(GtkWidget *wdg, GdkEventButton *e, gpointer d) {
+  Inst *self = d;
+  int i = mon_at(self, e->x, e->y);
+  if (i < 0) return FALSE;
+  select_mon(self, i);
+  Mon *m = &g_array_index(self->mons, Mon, i);
+  int cw = gtk_widget_get_allocated_width(wdg), ch = gtk_widget_get_allocated_height(wdg);
+  double s; int ox, oy; canvas_xform(self, cw, ch, &s, &ox, &oy);
+  self->drag = 1;
+  self->drag_ox = (int)((e->x - ox) / s) - m->sel_x;   // grab offset in world coords
+  self->drag_oy = (int)((e->y - oy) / s) - m->sel_y;
+  return TRUE;
+}
+static gboolean canvas_motion(GtkWidget *wdg, GdkEventMotion *e, gpointer d) {
+  Inst *self = d;
+  if (!self->drag) return FALSE;
+  Mon *m = cur_mon(self); if (!m) return FALSE;
+  int cw = gtk_widget_get_allocated_width(wdg), ch = gtk_widget_get_allocated_height(wdg);
+  double s; int ox, oy; canvas_xform(self, cw, ch, &s, &ox, &oy);
+  m->sel_x = (int)((e->x - ox) / s) - self->drag_ox;
+  m->sel_y = (int)((e->y - oy) / s) - self->drag_oy;
+  gtk_widget_queue_draw(self->canvas);
+  return TRUE;
+}
+// snap the dragged monitor's edges to neighbours and remove gaps/overlaps
+static void snap_selected(Inst *self) {
+  Mon *m = cur_mon(self); if (!m) return;
+  int mx, my, mw, mh; mon_rect(m, &mx, &my, &mw, &mh);
+  const int TH = 120;   // world-coord snap threshold
+  int bestdx = TH + 1, bestdy = TH + 1, sdx = 0, sdy = 0;
+  for (guint i = 0; i < self->mons->len; i++) {
+    if ((int)i == self->sel) continue;
+    int ox, oy, ow, oh; mon_rect(&g_array_index(self->mons, Mon, i), &ox, &oy, &ow, &oh);
+    // horizontal: snap left-to-right / right-to-left / align-left / align-right
+    int cand_x[] = { ox + ow - mx, ox - (mx + mw), ox - mx, (ox + ow) - (mx + mw) };
+    for (int k = 0; k < 4; k++) if (abs(cand_x[k]) < abs(bestdx)) { bestdx = cand_x[k]; sdx = 1; }
+    int cand_y[] = { oy + oh - my, oy - (my + mh), oy - my, (oy + oh) - (my + mh) };
+    for (int k = 0; k < 4; k++) if (abs(cand_y[k]) < abs(bestdy)) { bestdy = cand_y[k]; sdy = 1; }
+  }
+  if (sdx && abs(bestdx) <= TH) m->sel_x += bestdx;
+  if (sdy && abs(bestdy) <= TH) m->sel_y += bestdy;
+}
+static void refresh_pos_fields(Inst *self);   // fwd
+static gboolean canvas_release(GtkWidget *wdg, GdkEventButton *e, gpointer d) {
+  (void)wdg; (void)e; Inst *self = d;
+  if (!self->drag) return FALSE;
+  self->drag = 0;
+  snap_selected(self);
+  refresh_pos_fields(self);
+  gtk_widget_queue_draw(self->canvas);
+  return TRUE;
+}
+
+// ─── detail controls ─────────────────────────────────────────────────────────
+static void on_res_changed(GtkComboBox *c, gpointer d);   // fwd
+
+static void refresh_pos_fields(Inst *self) {
+  Mon *m = cur_mon(self); if (!m || !self->w_posx) return;
+  self->loading = 1;
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_posx), m->sel_x);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_posy), m->sel_y);
+  self->loading = 0;
 }
 
 static void on_apply(GtkButton *b, gpointer d) {
   (void)b; Inst *self = d;
-  int w = self->cur_w, h = self->cur_h, mhz = self->cur_refresh_mhz;
-  selected_mode(self, &w, &h, &mhz);
-  double scale = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_scale));
-  int vrr = gtk_switch_get_active(GTK_SWITCH(self->w_vrr));
-  int hdr = gtk_switch_get_active(GTK_SWITCH(self->w_hdr));
-  double hmax = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hmax));
-  double hmin = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hmin));
-  double hfall = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hfall));
-  write_monitors_kdl(self, w, h, mhz, scale, vrr, hdr, hmax, hmin, hfall);
+  Mon *m = cur_mon(self);
+  if (m) {
+    // pull the selected mode from the refresh combo (id = index into m->modes)
+    const char *rid = gtk_combo_box_get_active_id(GTK_COMBO_BOX(self->w_refresh));
+    if (rid) {
+      int mi = atoi(rid);
+      if (mi >= 0 && (guint)mi < m->modes->len) {
+        Mode md = g_array_index(m->modes, Mode, mi);
+        m->sel_w = md.w; m->sel_h = md.h; m->sel_mhz = md.refresh_mhz;
+      }
+    }
+    m->sel_scale = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_scale));
+    m->sel_vrr = gtk_switch_get_active(GTK_SWITCH(self->w_vrr));
+    m->sel_hdr = gtk_switch_get_active(GTK_SWITCH(self->w_hdr));
+    m->sel_hmax = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hmax));
+    m->sel_hmin = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hmin));
+    m->sel_hfall = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hfall));
+    m->sel_x = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posx));
+    m->sel_y = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posy));
+  }
+  write_monitors_kdl(self);
   amsg_dispatch("reload_config");
   set_status(self, "Applied");
-  // refresh cached state so the bar label + next open reflect the change
-  self->cur_w = w; self->cur_h = h; self->cur_refresh_mhz = mhz;
-  self->scale = scale; self->vrr = vrr; self->hdr = hdr;
-  update_bar(self);
 }
 
-// HDR toggle: live via dispatch, and persisted to monitors.kdl so a later
-// reload keeps it. toggle_hdr flips the active output's HDR immediately.
-static gboolean on_hdr_switch(GtkSwitch *sw, gboolean state, gpointer d) {
-  (void)sw; Inst *self = d;
-  if (self->loading) return FALSE;
-  if (state != self->hdr) amsg_dispatch("toggle_hdr");
-  self->hdr = state;
-  return FALSE;   // let the switch update its visual state
+static void on_hdr_switch2(GtkSwitch *sw, gboolean state, gpointer d) {
+  (void)sw; Inst *self = d; Mon *m = cur_mon(self);
+  if (self->loading || !m) return;
+  // toggle_hdr acts on the ACTIVE output; only fire live if this is it.
+  if (m->active && state != m->hdr) amsg_dispatch("toggle_hdr");
+  m->sel_hdr = state;
 }
 static void on_sdr_changed(GtkRange *r, gpointer d) {
   Inst *self = d;
   if (self->loading) return;
   int v = (int)lround(gtk_range_get_value(r));
   char verb[48]; g_snprintf(verb, sizeof verb, "set_sdr_luminance,%d", v);
-  amsg_dispatch(verb);
-  self->sdr_lum = v;
+  amsg_dispatch(verb); self->sdr_lum = v;
 }
-// changing resolution repopulates the refresh combo for that resolution
+static void on_posxy_changed(GtkSpinButton *sp, gpointer d) {
+  (void)sp; Inst *self = d; Mon *m = cur_mon(self);
+  if (self->loading || !m) return;
+  m->sel_x = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posx));
+  m->sel_y = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posy));
+  gtk_widget_queue_draw(self->canvas);
+}
 static void on_res_changed(GtkComboBox *c, gpointer d) {
-  Inst *self = d;
-  if (self->loading || !self->w_refresh) return;
-  const char *res = gtk_combo_box_get_active_id(c);   // "WxH"
+  Inst *self = d; Mon *m = cur_mon(self);
+  if (self->loading || !m || !self->w_refresh) return;
+  const char *res = gtk_combo_box_get_active_id(c);
   if (!res) return;
   int rw = 0, rh = 0; sscanf(res, "%dx%d", &rw, &rh);
   gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(self->w_refresh));
-  int best = -1; double best_hz = -1;
-  for (guint i = 0; i < self->modes->len; i++) {
-    Mode m = g_array_index(self->modes, Mode, i);
-    if (m.w != rw || m.h != rh) continue;
+  int best = -1; double best_hz = -1; int chose = 0;
+  for (guint i = 0; i < m->modes->len; i++) {
+    Mode md = g_array_index(m->modes, Mode, i);
+    if (md.w != rw || md.h != rh) continue;
     char id[16], lbl[32], rb[24];
     g_snprintf(id, sizeof id, "%u", i);
-    fmt_refresh(m.refresh_mhz, rb, sizeof rb);
+    fmt_refresh(md.refresh_mhz, rb, sizeof rb);
     g_snprintf(lbl, sizeof lbl, "%s Hz", rb);
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_refresh), id, lbl);
-    double hz = m.refresh_mhz / 1000.0;
-    if (hz > best_hz) { best_hz = hz; best = i; }   // default: highest refresh
-    if (rw == self->cur_w && rh == self->cur_h &&
-        abs(m.refresh_mhz - self->cur_refresh_mhz) < 100) {
-      char cid[16]; g_snprintf(cid, sizeof cid, "%u", i);
-      gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_refresh), cid);
-      best = -1;   // current selected; don't override
+    if (md.refresh_mhz / 1000.0 > best_hz) { best_hz = md.refresh_mhz / 1000.0; best = i; }
+    if (rw == m->sel_w && rh == m->sel_h && abs(md.refresh_mhz - m->sel_mhz) < 100) {
+      gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_refresh), id); chose = 1;
     }
   }
-  if (best >= 0) {
+  if (!chose && best >= 0) {
     char cid[16]; g_snprintf(cid, sizeof cid, "%d", best);
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_refresh), cid);
   }
 }
 
-// ─── popup ───────────────────────────────────────────────────────────────────
+// ─── popup build ─────────────────────────────────────────────────────────────
 static GtkWidget *row(GtkWidget *v, const char *label, GtkWidget *ctl) {
   GtkWidget *r = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
   GtkWidget *l = gtk_label_new(label);
-  gtk_widget_set_halign(l, GTK_ALIGN_START);
-  gtk_widget_set_hexpand(l, TRUE);
+  gtk_widget_set_halign(l, GTK_ALIGN_START); gtk_widget_set_hexpand(l, TRUE);
   gtk_style_context_add_class(gtk_widget_get_style_context(l), "dp-key");
   gtk_box_pack_start(GTK_BOX(r), l, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(r), ctl, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(v), r, FALSE, FALSE, 0);
   return r;
 }
-static void head(GtkWidget *v, const char *txt) {
-  GtkWidget *h = gtk_label_new(txt);
-  gtk_widget_set_halign(h, GTK_ALIGN_START);
-  gtk_style_context_add_class(gtk_widget_get_style_context(h), "dp-head");
-  gtk_box_pack_start(GTK_BOX(v), h, FALSE, FALSE, 0);
-}
 
-static void rebuild_popover(Inst *self) {
-  read_state(self);
-  GtkWidget *old = gtk_bin_get_child(GTK_BIN(self->pop.win));
-  if (old) gtk_widget_destroy(old);
+// populate the per-monitor detail widgets from mons[sel]
+static void load_details(Inst *self) {
+  Mon *m = cur_mon(self); if (!m) return;
   self->loading = 1;
-  GtkWidget *v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-  gtk_style_context_add_class(gtk_widget_get_style_context(v), "dp-pop");
-  gtk_widget_set_margin_start(v, 18); gtk_widget_set_margin_end(v, 18);
-  gtk_widget_set_margin_top(v, 16); gtk_widget_set_margin_bottom(v, 16);
-  gtk_widget_set_size_request(v, 440, -1);
-
   char title[96];
-  g_snprintf(title, sizeof title, "Display · %s",
-             self->output_name[0] ? self->output_name : "?");
-  head(v, title);
-
-  // ── resolution + refresh ──
-  self->w_res = gtk_combo_box_text_new();
-  // unique resolutions, highest first
-  for (guint i = 0; i < self->modes->len; i++) {
-    Mode m = g_array_index(self->modes, Mode, i);
-    char id[16]; g_snprintf(id, sizeof id, "%dx%d", m.w, m.h);
-    // skip if already added
+  g_snprintf(title, sizeof title, "%s%s", m->name, m->active ? "  (active)" : "");
+  gtk_label_set_text(GTK_LABEL(self->w_montitle), title);
+  // resolution combo
+  gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(self->w_res));
+  for (guint i = 0; i < m->modes->len; i++) {
+    Mode md = g_array_index(m->modes, Mode, i);
+    char id[16]; g_snprintf(id, sizeof id, "%dx%d", md.w, md.h);
+    // dedupe
     int dup = 0;
     GtkTreeModel *mdl = gtk_combo_box_get_model(GTK_COMBO_BOX(self->w_res));
     GtkTreeIter it;
@@ -332,50 +464,100 @@ static void rebuild_popover(Inst *self) {
     }
     if (!dup) gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_res), id, id);
   }
-  self->w_refresh = gtk_combo_box_text_new();
+  { char cur[16]; g_snprintf(cur, sizeof cur, "%dx%d", m->sel_w, m->sel_h);
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_res), cur); }
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_scale), m->sel_scale);
+  gtk_switch_set_active(GTK_SWITCH(self->w_vrr), m->sel_vrr);
+  gtk_widget_set_sensitive(self->w_vrr, m->vrr_capable);
+  gtk_switch_set_active(GTK_SWITCH(self->w_hdr), m->sel_hdr);
+  gtk_widget_set_sensitive(self->w_hdr, m->hdr_capable);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hmax), m->sel_hmax);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hmin), m->sel_hmin);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hfall), m->sel_hfall);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_posx), m->sel_x);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_posy), m->sel_y);
+  self->loading = 0;
+  on_res_changed(GTK_COMBO_BOX(self->w_res), self);   // refresh combo
+}
+
+static void select_mon(Inst *self, int idx) {
+  if (idx < 0 || idx >= (int)self->mons->len) return;
+  self->sel = idx;
+  load_details(self);
+  if (self->canvas) gtk_widget_queue_draw(self->canvas);
+}
+
+static void head(GtkWidget *v, const char *txt) {
+  GtkWidget *h = gtk_label_new(txt);
+  gtk_widget_set_halign(h, GTK_ALIGN_START);
+  gtk_style_context_add_class(gtk_widget_get_style_context(h), "dp-head");
+  gtk_box_pack_start(GTK_BOX(v), h, FALSE, FALSE, 0);
+}
+
+static void rebuild_popover(Inst *self) {
+  read_all(self);
+  GtkWidget *old = gtk_bin_get_child(GTK_BIN(self->pop.win));
+  if (old) gtk_widget_destroy(old);
+  self->loading = 1;
+  GtkWidget *v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+  gtk_style_context_add_class(gtk_widget_get_style_context(v), "dp-pop");
+  gtk_widget_set_margin_start(v, 18); gtk_widget_set_margin_end(v, 18);
+  gtk_widget_set_margin_top(v, 16); gtk_widget_set_margin_bottom(v, 16);
+  gtk_widget_set_size_request(v, 460, -1);
+
+  head(v, "Displays");
+  // ── layout canvas ──
+  self->canvas = gtk_drawing_area_new();
+  gtk_widget_set_size_request(self->canvas, 424, 180);
+  gtk_style_context_add_class(gtk_widget_get_style_context(self->canvas), "dp-canvas");
+  gtk_widget_add_events(self->canvas, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                                      GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK);
+  g_signal_connect(self->canvas, "draw", G_CALLBACK(canvas_draw), self);
+  g_signal_connect(self->canvas, "button-press-event", G_CALLBACK(canvas_press), self);
+  g_signal_connect(self->canvas, "motion-notify-event", G_CALLBACK(canvas_motion), self);
+  g_signal_connect(self->canvas, "button-release-event", G_CALLBACK(canvas_release), self);
+  gtk_box_pack_start(GTK_BOX(v), self->canvas, FALSE, FALSE, 0);
+  GtkWidget *hint = gtk_label_new("drag to arrange · click to select");
+  gtk_widget_set_halign(hint, GTK_ALIGN_START);
+  gtk_style_context_add_class(gtk_widget_get_style_context(hint), "dp-status");
+  gtk_box_pack_start(GTK_BOX(v), hint, FALSE, FALSE, 0);
+
+  gtk_box_pack_start(GTK_BOX(v), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
+  self->w_montitle = gtk_label_new("");
+  gtk_widget_set_halign(self->w_montitle, GTK_ALIGN_START);
+  gtk_style_context_add_class(gtk_widget_get_style_context(self->w_montitle), "dp-head");
+  gtk_box_pack_start(GTK_BOX(v), self->w_montitle, FALSE, FALSE, 0);
+
+  self->w_res = gtk_combo_box_text_new();
   g_signal_connect(self->w_res, "changed", G_CALLBACK(on_res_changed), self);
-  {
-    char cur_res[16]; g_snprintf(cur_res, sizeof cur_res, "%dx%d", self->cur_w, self->cur_h);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_res), cur_res);
-  }
+  self->w_refresh = gtk_combo_box_text_new();
   row(v, "Resolution", self->w_res);
   row(v, "Refresh", self->w_refresh);
-
-  // ── scale ──
   self->w_scale = gtk_spin_button_new_with_range(0.5, 3.0, 0.05);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_scale), self->scale);
   row(v, "Scale", self->w_scale);
-
-  // ── VRR ──
-  self->w_vrr = gtk_switch_new();
-  gtk_switch_set_active(GTK_SWITCH(self->w_vrr), self->vrr);
-  gtk_widget_set_sensitive(self->w_vrr, self->vrr_capable);
-  gtk_widget_set_valign(self->w_vrr, GTK_ALIGN_CENTER);
-  row(v, self->vrr_capable ? "VRR (adaptive sync)" : "VRR (unsupported)", self->w_vrr);
+  { GtkWidget *pb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    self->w_posx = gtk_spin_button_new_with_range(-20000, 20000, 1);
+    self->w_posy = gtk_spin_button_new_with_range(-20000, 20000, 1);
+    g_signal_connect(self->w_posx, "value-changed", G_CALLBACK(on_posxy_changed), self);
+    g_signal_connect(self->w_posy, "value-changed", G_CALLBACK(on_posxy_changed), self);
+    gtk_box_pack_start(GTK_BOX(pb), self->w_posx, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pb), self->w_posy, FALSE, FALSE, 0);
+    row(v, "Position X / Y", pb); }
+  self->w_vrr = gtk_switch_new(); gtk_widget_set_valign(self->w_vrr, GTK_ALIGN_CENTER);
+  row(v, "VRR (adaptive sync)", self->w_vrr);
 
   gtk_box_pack_start(GTK_BOX(v), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
   head(v, "HDR");
-  // ── HDR toggle (instant) ──
-  self->w_hdr = gtk_switch_new();
-  gtk_switch_set_active(GTK_SWITCH(self->w_hdr), self->hdr);
-  gtk_widget_set_sensitive(self->w_hdr, self->hdr_capable);
-  gtk_widget_set_valign(self->w_hdr, GTK_ALIGN_CENTER);
-  g_signal_connect(self->w_hdr, "state-set", G_CALLBACK(on_hdr_switch), self);
-  row(v, self->hdr_capable ? "HDR" : "HDR (unsupported)", self->w_hdr);
-
-  // ── HDR luminances ──
+  self->w_hdr = gtk_switch_new(); gtk_widget_set_valign(self->w_hdr, GTK_ALIGN_CENTER);
+  g_signal_connect(self->w_hdr, "state-set", G_CALLBACK(on_hdr_switch2), self);
+  row(v, "HDR", self->w_hdr);
   self->w_hmax = gtk_spin_button_new_with_range(0, 10000, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hmax), self->hdr_max);
   row(v, "Max luminance (nits)", self->w_hmax);
   self->w_hfall = gtk_spin_button_new_with_range(0, 10000, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hfall), self->hdr_fall);
   row(v, "Max frame-avg (nits)", self->w_hfall);
   self->w_hmin = gtk_spin_button_new_with_range(0, 10, 0.001);
   gtk_spin_button_set_digits(GTK_SPIN_BUTTON(self->w_hmin), 3);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hmin), self->hdr_min);
   row(v, "Min luminance (nits)", self->w_hmin);
-
-  // ── SDR reference luminance (instant) ──
   self->w_sdr = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 80, 1000, 1);
   gtk_scale_set_draw_value(GTK_SCALE(self->w_sdr), TRUE);
   gtk_scale_set_value_pos(GTK_SCALE(self->w_sdr), GTK_POS_RIGHT);
@@ -383,14 +565,12 @@ static void rebuild_popover(Inst *self) {
   gtk_range_set_value(GTK_RANGE(self->w_sdr), self->sdr_lum);
   gtk_style_context_add_class(gtk_widget_get_style_context(self->w_sdr), "dp-scale");
   g_signal_connect(self->w_sdr, "value-changed", G_CALLBACK(on_sdr_changed), self);
-  row(v, "SDR luminance", self->w_sdr);
+  row(v, "SDR luminance (global)", self->w_sdr);
 
   gtk_box_pack_start(GTK_BOX(v), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
-  // ── apply row (resolution/scale/VRR/HDR-lum need a reload) ──
   GtkWidget *ar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
   self->w_status = gtk_label_new("");
-  gtk_widget_set_halign(self->w_status, GTK_ALIGN_START);
-  gtk_widget_set_hexpand(self->w_status, TRUE);
+  gtk_widget_set_halign(self->w_status, GTK_ALIGN_START); gtk_widget_set_hexpand(self->w_status, TRUE);
   gtk_style_context_add_class(gtk_widget_get_style_context(self->w_status), "dp-status");
   GtkWidget *apply = gtk_button_new_with_label("Apply");
   gtk_style_context_add_class(gtk_widget_get_style_context(apply), "dp-apply");
@@ -403,7 +583,11 @@ static void rebuild_popover(Inst *self) {
   gtk_container_add(GTK_CONTAINER(self->pop.win), v);
   gtk_widget_show_all(v);
   self->loading = 0;
-  on_res_changed(GTK_COMBO_BOX(self->w_res), self);   // populate refresh combo
+  // default selection: the active monitor
+  int def = 0;
+  for (guint i = 0; i < self->mons->len; i++)
+    if (g_array_index(self->mons, Mon, i).active) { def = i; break; }
+  select_mon(self, def);
 }
 static void rebuild_cb(gpointer user) { rebuild_popover(user); }
 
@@ -423,7 +607,6 @@ static GtkWidget *mklabel(const char *t, const char *cls) {
 void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entries, size_t entries_len) {
   Inst *self = g_new0(Inst, 1);
   self->icon_size = 24;
-  self->scale = 1.0;
   for (size_t i = 0; i < entries_len; i++) {
     if (!strcmp(entries[i].key, "icon-size")) { self->icon_size = atoi(entries[i].value); if (self->icon_size < 8) self->icon_size = 8; }
     else if (!strcmp(entries[i].key, "icon-dir")) { g_free(self->icon_dir); self->icon_dir = g_strdup(entries[i].value); }
@@ -455,14 +638,15 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
   gtk_container_add(root, self->box);
   gtk_widget_show_all(GTK_WIDGET(root));
 
-  read_state(self);
+  read_all(self);
   update_bar(self);
   return self;
 }
 void wbcffi_deinit(void *instance) {
   Inst *self = instance;
   wbpop_destroy(&self->pop);
-  if (self->modes) g_array_free(self->modes, TRUE);
+  mons_clear(self);
+  if (self->mons) g_array_free(self->mons, TRUE);
   g_free(self->icon_dir);
   g_free(self->monitors_kdl);
   g_free(self);
