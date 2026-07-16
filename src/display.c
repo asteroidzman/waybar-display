@@ -61,6 +61,8 @@ typedef struct {
   int tab;                 // 0 = Display, 1 = Wallpaper
   char *wp_conf;           // ~/.config/waybar/wallpaper.conf
   GtkWidget *w_wpfolder, *w_wpinterval, *w_wporder, *w_wpmode, *w_wpmon, *w_wpflow;
+  guint thumb_idle;        // async thumbnail loader source
+  GPtrArray *thumb_q;      // pending {GtkImage*, char*path} to load
 } Inst;
 
 // ─── amsg ────────────────────────────────────────────────────────────────────
@@ -733,6 +735,50 @@ static int is_image(const char *name) {
 static gint cmp_names(gconstpointer a, gconstpointer b) {
   return g_ascii_strcasecmp(*(const char *const *)a, *(const char *const *)b);
 }
+
+// Disk-cached scaled thumbnail: decode+scale once, cache a small PNG keyed by
+// path+mtime+size, then load the cheap PNG on subsequent opens.
+static GdkPixbuf *thumb_pixbuf(const char *path) {
+  GStatBuf st;
+  if (g_stat(path, &st) != 0) return NULL;
+  char *cdir = g_build_filename(g_get_user_cache_dir(), "waybar-display", "thumbs", NULL);
+  char *key = g_strdup_printf("%s|%ld|%ld", path, (long)st.st_mtime, (long)st.st_size);
+  char *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA1, key, -1);
+  char *cache = g_strdup_printf("%s/%s.png", cdir, hash);
+  GdkPixbuf *pb = NULL;
+  if (g_file_test(cache, G_FILE_TEST_EXISTS))
+    pb = gdk_pixbuf_new_from_file(cache, NULL);
+  if (!pb) {
+    pb = gdk_pixbuf_new_from_file_at_scale(path, 132, 74, TRUE, NULL);
+    if (pb) {
+      g_mkdir_with_parents(cdir, 0755);
+      gdk_pixbuf_save(pb, cache, "png", NULL, NULL);
+    }
+  }
+  g_free(cdir); g_free(key); g_free(hash); g_free(cache);
+  return pb;
+}
+
+// async loader: fill a few thumbnails per idle tick so the popup opens instantly
+typedef struct { GtkWidget *img; char *path; } ThumbJob;
+static void thumbjob_free(gpointer p) { ThumbJob *j = p; g_free(j->path); g_free(j); }
+static void thumb_q_clear(Inst *self) {
+  if (self->thumb_idle) { g_source_remove(self->thumb_idle); self->thumb_idle = 0; }
+  if (self->thumb_q) { g_ptr_array_free(self->thumb_q, TRUE); self->thumb_q = NULL; }
+}
+static gboolean thumb_load_cb(gpointer d) {
+  Inst *self = d;
+  if (!self->thumb_q || self->thumb_q->len == 0) { self->thumb_idle = 0; return G_SOURCE_REMOVE; }
+  for (int k = 0; k < 4 && self->thumb_q->len; k++) {
+    ThumbJob *j = g_ptr_array_index(self->thumb_q, 0);
+    GdkPixbuf *pb = thumb_pixbuf(j->path);
+    if (pb) { gtk_image_set_from_pixbuf(GTK_IMAGE(j->img), pb); g_object_unref(pb); }
+    g_ptr_array_remove_index(self->thumb_q, 0);   // frees j via free-func
+  }
+  if (self->thumb_q->len == 0) { self->thumb_idle = 0; return G_SOURCE_REMOVE; }
+  return G_SOURCE_CONTINUE;
+}
+
 static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
   head(v, "Wallpaper");
   char *folder = wp_get(self, "folder");
@@ -801,6 +847,8 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
   gtk_box_pack_start(GTK_BOX(v), scroll, TRUE, TRUE, 0);
 
   char *curwp = wp_get(self, "wallpaper");
+  thumb_q_clear(self);
+  self->thumb_q = g_ptr_array_new_with_free_func(thumbjob_free);
   GDir *d = g_dir_open(folder, 0, NULL);
   int count = 0;
   if (d) {
@@ -809,11 +857,11 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
     while ((nm = g_dir_read_name(d))) if (is_image(nm)) g_ptr_array_add(names, g_strdup(nm));
     g_dir_close(d);
     g_ptr_array_sort(names, cmp_names);
-    for (guint i = 0; i < names->len && count < 200; i++) {
+    for (guint i = 0; i < names->len && count < 400; i++) {
       char *path = g_build_filename(folder, g_ptr_array_index(names, i), NULL);
-      GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_scale(path, 132, 74, TRUE, NULL);
-      if (!pb) { g_free(path); continue; }
-      GtkWidget *img = gtk_image_new_from_pixbuf(pb); g_object_unref(pb);
+      // empty, fixed-size image now (instant); the real thumb loads async
+      GtkWidget *img = gtk_image_new();
+      gtk_widget_set_size_request(img, 132, 74);
       GtkWidget *btn = gtk_button_new();
       gtk_button_set_image(GTK_BUTTON(btn), img);
       gtk_style_context_add_class(gtk_widget_get_style_context(btn), "wp-thumb");
@@ -822,11 +870,13 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
       ThumbCtx *t = g_new0(ThumbCtx, 1); t->self = self; g_strlcpy(t->path, path, sizeof t->path);
       g_signal_connect_data(btn, "clicked", G_CALLBACK(on_wp_thumb), t, thumbctx_free, 0);
       gtk_flow_box_insert(GTK_FLOW_BOX(self->w_wpflow), btn, -1);
-      g_free(path);
+      ThumbJob *j = g_new0(ThumbJob, 1); j->img = img; j->path = path;   // takes path
+      g_ptr_array_add(self->thumb_q, j);
       count++;
     }
     g_ptr_array_free(names, TRUE);
   }
+  if (count) self->thumb_idle = g_idle_add(thumb_load_cb, self);
   if (!count) {
     GtkWidget *e = gtk_label_new("No images in this folder");
     gtk_style_context_add_class(gtk_widget_get_style_context(e), "dp-status");
@@ -843,6 +893,7 @@ static void on_tab_clicked(GtkButton *b, gpointer d) {
 }
 static void rebuild_popover(Inst *self) {
   read_all(self);
+  thumb_q_clear(self);   // stop async loader before its target images are freed
   GtkWidget *old = gtk_bin_get_child(GTK_BIN(self->pop.win));
   if (old) gtk_widget_destroy(old);
   self->loading = 1;
@@ -936,6 +987,7 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
 void wbcffi_deinit(void *instance) {
   Inst *self = instance;
   wb_reader_free(self->watcher);
+  thumb_q_clear(self);
   wbpop_destroy(&self->pop);
   mons_clear(self);
   if (self->mons) g_array_free(self->mons, TRUE);
