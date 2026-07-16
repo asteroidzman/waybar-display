@@ -168,10 +168,10 @@ static gboolean bar_draw(GtkWidget *wdg, cairo_t *cr, gpointer d) {
   Inst *self = d;
   if (!self->mons || !self->mons->len) return FALSE;
   int cw = gtk_widget_get_allocated_width(wdg), ch = gtk_widget_get_allocated_height(wdg);
-  GdkRGBA accent;
+  GdkRGBA accent;   // widget `color` = @primary (CSS): the active monitor
   gtk_style_context_get_color(gtk_widget_get_style_context(wdg),
                               gtk_widget_get_state_flags(wdg), &accent);
-  GdkRGBA dim = { accent.red, accent.green, accent.blue, 0.45 };
+  GdkRGBA neutral = { 0.62, 0.65, 0.70, 1.0 };   // inactive monitors, plain grey
   // bbox of current logical rects
   int minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
   for (guint i = 0; i < self->mons->len; i++) {
@@ -194,12 +194,12 @@ static gboolean bar_draw(GtkWidget *wdg, cairo_t *cr, gpointer d) {
     double rw = (mon->lw > 0 ? mon->lw : 1) * s, rh = (mon->lh > 0 ? mon->lh : 1) * s;
     if (rw < 3) rw = 3;
     if (rh < 3) rh = 3;
-    GdkRGBA c = mon->active ? accent : dim;
-    cairo_set_source_rgba(cr, c.red, c.green, c.blue, mon->active ? 0.9 : 0.22);
+    GdkRGBA c = mon->active ? accent : neutral;
+    cairo_set_source_rgba(cr, c.red, c.green, c.blue, mon->active ? 0.85 : 0.20);
     cairo_rectangle(cr, rx, ry, rw - 1, rh - 1);
     cairo_fill(cr);
-    cairo_set_source_rgba(cr, c.red, c.green, c.blue, mon->active ? 1.0 : 0.55);
-    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgba(cr, c.red, c.green, c.blue, mon->active ? 1.0 : 0.7);
+    cairo_set_line_width(cr, mon->active ? 1.6 : 1.0);
     cairo_rectangle(cr, rx + 0.5, ry + 0.5, rw - 2, rh - 2);
     cairo_stroke(cr);
   }
