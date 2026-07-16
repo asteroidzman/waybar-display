@@ -43,7 +43,8 @@ typedef struct {
 } Mon;
 
 typedef struct {
-  GtkWidget *box, *icon, *label;
+  GtkWidget *box, *bar_area;   // bar pill: a mini layout drawing (active highlighted)
+  guint poll_id;               // refresh the mini layout on hotplug
   WbPop pop;
   char *icon_dir; int icon_size;
   char *monitors_kdl;
@@ -152,20 +153,60 @@ static Mon *cur_mon(Inst *self) {
   return &g_array_index(self->mons, Mon, self->sel);
 }
 
-// ─── bar pill ────────────────────────────────────────────────────────────────
-static void update_bar(Inst *self) {
-  wb_icon_set(self->icon, "display.svg");
-  Mon *a = NULL;
-  for (guint i = 0; self->mons && i < self->mons->len; i++) {
+// Pango layout using the widget's interface font (CSS "font", i.e. Ubuntu).
+static PangoLayout *themed_layout(GtkWidget *wdg, cairo_t *cr) {
+  PangoLayout *pl = pango_cairo_create_layout(cr);
+  PangoFontDescription *fd = NULL;
+  gtk_style_context_get(gtk_widget_get_style_context(wdg),
+                        gtk_widget_get_state_flags(wdg), "font", &fd, NULL);
+  if (fd) { pango_layout_set_font_description(pl, fd); pango_font_description_free(fd); }
+  return pl;
+}
+
+// ─── bar pill: mini layout of the outputs, active one highlighted ─────────────
+static gboolean bar_draw(GtkWidget *wdg, cairo_t *cr, gpointer d) {
+  Inst *self = d;
+  if (!self->mons || !self->mons->len) return FALSE;
+  int cw = gtk_widget_get_allocated_width(wdg), ch = gtk_widget_get_allocated_height(wdg);
+  GdkRGBA accent;
+  gtk_style_context_get_color(gtk_widget_get_style_context(wdg),
+                              gtk_widget_get_state_flags(wdg), &accent);
+  GdkRGBA dim = { accent.red, accent.green, accent.blue, 0.45 };
+  // bbox of current logical rects
+  int minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
+  for (guint i = 0; i < self->mons->len; i++) {
     Mon *m = &g_array_index(self->mons, Mon, i);
-    if (m->active) { a = m; break; }
-    if (!a) a = m;
+    int w = m->lw > 0 ? m->lw : 1, h = m->lh > 0 ? m->lh : 1;
+    if (m->lx < minx) minx = m->lx;
+    if (m->ly < miny) miny = m->ly;
+    if (m->lx + w > maxx) maxx = m->lx + w;
+    if (m->ly + h > maxy) maxy = m->ly + h;
   }
-  char t[48];
-  if (a && a->cur_w > 0)
-    g_snprintf(t, sizeof t, "%d·%dHz", a->cur_h, (int)lround(a->cur_refresh_mhz / 1000.0));
-  else g_snprintf(t, sizeof t, "display");
-  gtk_label_set_text(GTK_LABEL(self->label), t);
+  double m = 2;   // px padding
+  double sx = (cw - 2 * m) / (double)(maxx - minx > 0 ? maxx - minx : 1);
+  double sy = (ch - 2 * m) / (double)(maxy - miny > 0 ? maxy - miny : 1);
+  double s = sx < sy ? sx : sy;
+  double ox = m - minx * s + (cw - 2 * m - (maxx - minx) * s) / 2;
+  double oy = m - miny * s + (ch - 2 * m - (maxy - miny) * s) / 2;
+  for (guint i = 0; i < self->mons->len; i++) {
+    Mon *mon = &g_array_index(self->mons, Mon, i);
+    double rx = ox + mon->lx * s, ry = oy + mon->ly * s;
+    double rw = (mon->lw > 0 ? mon->lw : 1) * s, rh = (mon->lh > 0 ? mon->lh : 1) * s;
+    if (rw < 3) rw = 3;
+    if (rh < 3) rh = 3;
+    GdkRGBA c = mon->active ? accent : dim;
+    cairo_set_source_rgba(cr, c.red, c.green, c.blue, mon->active ? 0.9 : 0.22);
+    cairo_rectangle(cr, rx, ry, rw - 1, rh - 1);
+    cairo_fill(cr);
+    cairo_set_source_rgba(cr, c.red, c.green, c.blue, mon->active ? 1.0 : 0.55);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, rx + 0.5, ry + 0.5, rw - 2, rh - 2);
+    cairo_stroke(cr);
+  }
+  return FALSE;
+}
+static void update_bar(Inst *self) {
+  if (self->bar_area) gtk_widget_queue_draw(self->bar_area);
 }
 
 // ─── monitors.kdl writer (all monitors) ──────────────────────────────────────
@@ -264,7 +305,7 @@ static gboolean canvas_draw(GtkWidget *wdg, cairo_t *cr, gpointer d) {
     char lbl[80];
     g_snprintf(lbl, sizeof lbl, "%s\n%d×%d", m->name, m->sel_w, m->sel_h);
     cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.95);
-    PangoLayout *pl = pango_cairo_create_layout(cr);
+    PangoLayout *pl = themed_layout(wdg, cr);
     pango_layout_set_text(pl, lbl, -1);
     pango_layout_set_alignment(pl, PANGO_ALIGN_CENTER);
     int pw, ph; pango_layout_get_pixel_size(pl, &pw, &ph);
@@ -598,12 +639,14 @@ static gboolean on_click(GtkWidget *w, GdkEventButton *ev, gpointer d) {
   return TRUE;
 }
 
-static GtkWidget *mklabel(const char *t, const char *cls) {
-  GtkWidget *l = gtk_label_new(t);
-  gtk_widget_set_valign(l, GTK_ALIGN_CENTER);
-  gtk_style_context_add_class(gtk_widget_get_style_context(l), cls);
-  return l;
+// Refresh the mini layout on monitor hotplug. Skip while the popup is open so
+// we don't rebuild the mons array under the live editing widgets.
+static gboolean poll_cb(gpointer d) {
+  Inst *self = d;
+  if (!wbpop_visible(&self->pop)) { read_all(self); update_bar(self); }
+  return G_SOURCE_CONTINUE;
 }
+
 void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entries, size_t entries_len) {
   Inst *self = g_new0(Inst, 1);
   self->icon_size = 24;
@@ -625,14 +668,14 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
   gtk_widget_set_name(self->box, "display");
   gtk_widget_add_events(self->box, GDK_BUTTON_PRESS_MASK);
   gtk_widget_set_margin_start(self->box, 6); gtk_widget_set_margin_end(self->box, 6);
-  GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-  self->icon = wb_icon_new(self->icon_dir, self->icon_size, NULL);
-  gtk_widget_set_valign(self->icon, GTK_ALIGN_CENTER);
-  gtk_style_context_add_class(gtk_widget_get_style_context(self->icon), "dp-icon");
-  self->label = mklabel("display", "dp-label");
-  gtk_box_pack_start(GTK_BOX(h), self->icon, FALSE, FALSE, 0);
-  gtk_box_pack_start(GTK_BOX(h), self->label, FALSE, FALSE, 0);
-  gtk_container_add(GTK_CONTAINER(self->box), h);
+  // bar pill: a mini layout drawing (active monitor highlighted)
+  self->bar_area = gtk_drawing_area_new();
+  int bw = self->icon_size * 5 / 3;   // ~landscape aspect for the mini layout
+  gtk_widget_set_size_request(self->bar_area, bw, self->icon_size);
+  gtk_widget_set_valign(self->bar_area, GTK_ALIGN_CENTER);
+  gtk_style_context_add_class(gtk_widget_get_style_context(self->bar_area), "dp-icon");
+  g_signal_connect(self->bar_area, "draw", G_CALLBACK(bar_draw), self);
+  gtk_container_add(GTK_CONTAINER(self->box), self->bar_area);
   wbpop_init(&self->pop, self->box, rebuild_cb, self);
   g_signal_connect(self->box, "button-press-event", G_CALLBACK(on_click), self);
   gtk_container_add(root, self->box);
@@ -640,10 +683,12 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
 
   read_all(self);
   update_bar(self);
+  self->poll_id = g_timeout_add_seconds(4, poll_cb, self);
   return self;
 }
 void wbcffi_deinit(void *instance) {
   Inst *self = instance;
+  if (self->poll_id) g_source_remove(self->poll_id);
   wbpop_destroy(&self->pop);
   mons_clear(self);
   if (self->mons) g_array_free(self->mons, TRUE);
