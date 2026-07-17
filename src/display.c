@@ -60,7 +60,7 @@ typedef struct {
 
   int tab;                 // 0 = Display, 1 = Wallpaper
   char *wp_conf;           // ~/.config/waybar/wallpaper.conf
-  GtkWidget *w_wpfolder, *w_wpinterval, *w_wporder, *w_wpmode, *w_wpmon, *w_wpflow;
+  GtkWidget *w_wpfolder, *w_wpinterval, *w_wporder, *w_wpflow;
   guint thumb_idle;        // async thumbnail loader source
   GPtrArray *thumb_q;      // pending {GtkImage*, char*path} to load
 } Inst;
@@ -245,12 +245,58 @@ static void fmt_refresh(int mhz, char *buf, size_t n) {
   if (fabs(hz - lround(hz)) < 0.05) g_snprintf(buf, n, "%ld", lround(hz));
   else g_snprintf(buf, n, "%.3f", hz);
 }
-static void write_monitors_kdl(Inst *self) {
+// Find the existing "output NAME { ... }" line for `name` in the file already
+// on disk, verbatim (including its trailing newline if any), or NULL if the
+// file doesn't exist / has no such line yet. Matches the exact output-name
+// token (not a prefix -- "DP-1" must not match "DP-10").
+static char *find_existing_output_line(const char *path, const char *name) {
+  char *contents = NULL;
+  if (!g_file_get_contents(path, &contents, NULL, NULL)) return NULL;
+  char *result = NULL;
+  char **lines = g_strsplit(contents, "\n", -1);
+  for (int i = 0; lines[i]; i++) {
+    const char *l = lines[i];
+    if (!g_str_has_prefix(l, "output ")) continue;
+    const char *tok = l + 7;
+    while (*tok == ' ') tok++;
+    size_t tlen = 0;
+    while (tok[tlen] && tok[tlen] != ' ' && tok[tlen] != '{') tlen++;
+    if (tlen == strlen(name) && strncmp(tok, name, tlen) == 0) {
+      result = g_strdup(l);
+      break;
+    }
+  }
+  g_strfreev(lines);
+  g_free(contents);
+  return result;
+}
+// Only `edited_name`'s block is regenerated from its live sel_* fields (the
+// ones on_apply() just set from the UI); every OTHER monitor's block is
+// carried forward VERBATIM from the file already on disk. Without this, every
+// monitor's block was regenerated from self->mons's sel_* on every Apply --
+// but sel_* for a monitor the user isn't currently editing is just whatever
+// the live IPC watch stream last happened to report (parse_monitors() reseeds
+// it unconditionally on every background update), which can be a transient
+// bad reading (e.g. a monitor mid-DPMS-retrain reporting 24Hz instead of its
+// real 144Hz) that then gets permanently baked into the config -- surviving
+// even a reboot, since nothing ever corrects it back once written.
+static void write_monitors_kdl(Inst *self, const char *edited_name) {
   GString *s = g_string_new(
       "// Managed by the waybar-display plugin — rewritten on each change.\n"
       "// One `output` block per monitor; reload_config applies live.\n");
   for (guint i = 0; i < self->mons->len; i++) {
     Mon *m = &g_array_index(self->mons, Mon, i);
+    if (edited_name && strcmp(m->name, edited_name) != 0) {
+      char *existing = find_existing_output_line(self->monitors_kdl, m->name);
+      if (existing) {
+        g_string_append(s, existing);
+        g_string_append_c(s, '\n');
+        g_free(existing);
+        continue;
+      }
+      // no prior on-disk entry for this monitor (newly connected) -- fall
+      // through and generate one from its current live state, same as before
+    }
     g_string_append_printf(s, "output %s {", m->name);
     if (m->sel_hdr) g_string_append(s, " hdr;");
     g_string_append_printf(s, " scale %.4g;", m->sel_scale);
@@ -445,7 +491,7 @@ static void on_apply(GtkButton *b, gpointer d) {
     m->sel_x = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posx));
     m->sel_y = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posy));
   }
-  write_monitors_kdl(self);
+  write_monitors_kdl(self, m ? m->name : NULL);
   amsg_dispatch("reload_config");
   set_status(self, "Applied");
 }
@@ -595,13 +641,12 @@ static void wp_set(Inst *self, const char *key, const char *val) {
   g_file_set_contents(self->wp_conf, s->str, s->len, NULL);
   g_string_free(s, TRUE);
 }
-// run set-wallpaper.sh [img [output]] to apply from the (just-written) config
-static void run_setwp(const char *img, const char *out) {
+// run set-wallpaper.sh [img] to apply from the (just-written) config
+static void run_setwp(const char *img) {
   char *script = g_build_filename(g_get_home_dir(), ".config/waybar/scripts/set-wallpaper.sh", NULL);
-  const char *argv[5]; int n = 0;
+  const char *argv[4]; int n = 0;
   argv[n++] = script;
   if (img) argv[n++] = img;
-  if (out) argv[n++] = out;
   argv[n] = NULL;
   GSubprocess *sp = g_subprocess_newv(argv, G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
                                             G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL);
@@ -627,23 +672,11 @@ static void on_wp_order(GtkComboBox *c, gpointer d) {
   Inst *self = d; if (self->loading) return;
   const char *o = gtk_combo_box_get_active_id(c); if (o) wp_set(self, "order", o);
 }
-static void on_wp_mode(GtkComboBox *c, gpointer d) {
-  Inst *self = d; if (self->loading) return;
-  const char *m = gtk_combo_box_get_active_id(c);
-  if (m) { wp_set(self, "mode", m); run_setwp(NULL, NULL); g_idle_add(do_rebuild, self); }
-}
-typedef struct { Inst *self; char path[1024]; } ThumbCtx;
+typedef struct { char path[1024]; } ThumbCtx;
 static void thumbctx_free(gpointer p, GClosure *c) { (void)c; g_free(p); }
 static void on_wp_thumb(GtkButton *b, gpointer d) {
-  (void)b; ThumbCtx *t = d; Inst *self = t->self;
-  char *mode = wp_get(self, "mode");
-  if (mode && !strcmp(mode, "per-monitor") && self->w_wpmon) {
-    const char *out = gtk_combo_box_get_active_id(GTK_COMBO_BOX(self->w_wpmon));
-    run_setwp(t->path, out && *out ? out : NULL);
-  } else {
-    run_setwp(t->path, NULL);   // shared / main
-  }
-  g_free(mode);
+  (void)b; ThumbCtx *t = d;
+  run_setwp(t->path);
 }
 
 // ─── Display tab (the monitor configuration) ─────────────────────────────────
@@ -784,7 +817,6 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
   char *folder = wp_get(self, "folder");
   if (!folder) folder = g_build_filename(g_get_home_dir(), "Pictures", NULL);
   char *order = wp_get(self, "order");
-  char *mode = wp_get(self, "mode");
   char *ivs = wp_get(self, "interval");
   int iv = ivs ? atoi(ivs) : 3600;
 
@@ -808,27 +840,6 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
   gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_wporder), order ? order : "random");
   g_signal_connect(self->w_wporder, "changed", G_CALLBACK(on_wp_order), self);
   row(v, "Order", self->w_wporder);
-
-  // mode
-  self->w_wpmode = gtk_combo_box_text_new();
-  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wpmode), "shared", "Same on all monitors");
-  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wpmode), "per-monitor", "Per monitor");
-  gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_wpmode), mode ? mode : "shared");
-  g_signal_connect(self->w_wpmode, "changed", G_CALLBACK(on_wp_mode), self);
-  row(v, "Mode", self->w_wpmode);
-
-  // per-monitor: which output the browser assigns to
-  self->w_wpmon = NULL;
-  if (mode && !strcmp(mode, "per-monitor")) {
-    self->w_wpmon = gtk_combo_box_text_new();
-    for (guint i = 0; i < self->mons->len; i++) {
-      Mon *m = &g_array_index(self->mons, Mon, i);
-      gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_wpmon), m->name, m->name);
-    }
-    Mon *cm = cur_mon(self);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_wpmon), cm ? cm->name : NULL);
-    row(v, "Set for monitor", self->w_wpmon);
-  }
 
   gtk_box_pack_start(GTK_BOX(v), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
 
@@ -867,7 +878,7 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
       gtk_style_context_add_class(gtk_widget_get_style_context(btn), "wp-thumb");
       if (curwp && !strcmp(curwp, path))
         gtk_style_context_add_class(gtk_widget_get_style_context(btn), "wp-current");
-      ThumbCtx *t = g_new0(ThumbCtx, 1); t->self = self; g_strlcpy(t->path, path, sizeof t->path);
+      ThumbCtx *t = g_new0(ThumbCtx, 1); g_strlcpy(t->path, path, sizeof t->path);
       g_signal_connect_data(btn, "clicked", G_CALLBACK(on_wp_thumb), t, thumbctx_free, 0);
       gtk_flow_box_insert(GTK_FLOW_BOX(self->w_wpflow), btn, -1);
       ThumbJob *j = g_new0(ThumbJob, 1); j->img = img; j->path = path;   // takes path
@@ -882,7 +893,7 @@ static void build_wallpaper_tab(Inst *self, GtkWidget *v) {
     gtk_style_context_add_class(gtk_widget_get_style_context(e), "dp-status");
     gtk_container_add(GTK_CONTAINER(self->w_wpflow), e);
   }
-  g_free(curwp); g_free(folder); g_free(order); g_free(mode); g_free(ivs);
+  g_free(curwp); g_free(folder); g_free(order); g_free(ivs);
 }
 
 // ─── tab bar + dispatch ──────────────────────────────────────────────────────
