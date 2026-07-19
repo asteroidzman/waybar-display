@@ -107,6 +107,7 @@ int main(void) {
 	// seeded "edit" fields mirror the just-parsed current values
 	CHECK(m0->sel_w == m0->cur_w && m0->sel_h == m0->cur_h,
 		"edited-value fields are seeded from the parsed current mode");
+	CHECK_STR(m0->sel_icc, m0->icc, "sel_icc (the editable ICC path) is seeded from the reported icc_profile");
 
 	g_object_unref(fp);
 

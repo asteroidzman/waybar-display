@@ -40,6 +40,7 @@ typedef struct {
   // edited values (widgets / canvas write here; Apply serializes these)
   int sel_w, sel_h, sel_mhz, sel_x, sel_y, sel_vrr, sel_hdr;
   double sel_scale, sel_hmax, sel_hmin, sel_hfall;
+  char sel_icc[512];
 } Mon;
 
 typedef struct {
@@ -53,7 +54,8 @@ typedef struct {
   int sel;                 // selected monitor index
 
   GtkWidget *canvas, *w_res, *w_refresh, *w_scale, *w_vrr, *w_hdr, *w_sdr,
-            *w_hmax, *w_hmin, *w_hfall, *w_posx, *w_posy, *w_status, *w_montitle;
+            *w_hmax, *w_hmin, *w_hfall, *w_posx, *w_posy, *w_status, *w_montitle,
+            *w_icc;
   int loading;
   int drag;                // dragging a monitor on the canvas?
   int drag_ox, drag_oy;    // grab offset within the monitor (real coords)
@@ -142,6 +144,7 @@ static void parse_monitors(Inst *self, JsonArray *arr) {
       m.sel_x = m.lx; m.sel_y = m.ly; m.sel_scale = m.scale;
       m.sel_vrr = m.vrr; m.sel_hdr = m.hdr;
       m.sel_hmax = m.hdr_max; m.sel_hmin = m.hdr_min; m.sel_hfall = m.hdr_fall;
+      g_strlcpy(m.sel_icc, m.icc, sizeof m.sel_icc);
       g_array_append_val(self->mons, m);
     }
   }
@@ -311,7 +314,7 @@ static void write_monitors_kdl(Inst *self, const char *edited_name) {
       if (m->sel_hmin > 0) g_string_append_printf(s, " min-luminance %.4g;", m->sel_hmin);
       if (m->sel_hfall > 0) g_string_append_printf(s, " max-fall %.4g;", m->sel_hfall);
     }
-    if (m->icc[0]) g_string_append_printf(s, " icc-profile \"%s\";", m->icc);
+    if (m->sel_icc[0]) g_string_append_printf(s, " icc-profile \"%s\";", m->sel_icc);
     g_string_append(s, " }\n");
   }
   g_file_set_contents(self->monitors_kdl, s->str, s->len, NULL);
@@ -490,6 +493,7 @@ static void on_apply(GtkButton *b, gpointer d) {
     m->sel_hfall = gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_hfall));
     m->sel_x = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posx));
     m->sel_y = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posy));
+    g_strlcpy(m->sel_icc, gtk_entry_get_text(GTK_ENTRY(self->w_icc)), sizeof m->sel_icc);
   }
   write_monitors_kdl(self, m ? m->name : NULL);
   amsg_dispatch("reload_config");
@@ -593,6 +597,7 @@ static void load_details(Inst *self) {
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_hfall), m->sel_hfall);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_posx), m->sel_x);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->w_posy), m->sel_y);
+  gtk_entry_set_text(GTK_ENTRY(self->w_icc), m->sel_icc);
   self->loading = 0;
   on_res_changed(GTK_COMBO_BOX(self->w_res), self);   // refresh combo
 }
@@ -721,6 +726,10 @@ static void build_display_tab(Inst *self, GtkWidget *v) {
     row(v, "Position X / Y", pb); }
   self->w_vrr = gtk_switch_new(); gtk_widget_set_valign(self->w_vrr, GTK_ALIGN_CENTER);
   row(v, "VRR (adaptive sync)", self->w_vrr);
+  self->w_icc = gtk_entry_new();
+  gtk_entry_set_placeholder_text(GTK_ENTRY(self->w_icc), "/path/to/profile.icm (SDR mode)");
+  gtk_widget_set_hexpand(self->w_icc, TRUE);
+  row(v, "ICC profile", self->w_icc);
 
   gtk_box_pack_start(GTK_BOX(v), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
   head(v, "HDR");
@@ -924,6 +933,8 @@ static void rebuild_popover(Inst *self) {
     if (i == self->tab) gtk_style_context_add_class(gtk_widget_get_style_context(tb), "dp-tab-active");
     g_object_set_data(G_OBJECT(tb), "tab", GINT_TO_POINTER(i));
     g_signal_connect(tb, "clicked", G_CALLBACK(on_tab_clicked), self);
+    if (getenv("WBTEST_DUMP_GEOM"))
+      g_signal_connect_after(tb, "draw", G_CALLBACK(wbtest_dump_geom_draw_cb), (gpointer)names[i]);
     gtk_box_pack_start(GTK_BOX(tabs), tb, TRUE, TRUE, 0);
   }
   gtk_box_pack_start(GTK_BOX(outer), tabs, FALSE, FALSE, 0);
