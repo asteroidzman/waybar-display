@@ -15,6 +15,12 @@ install: $(PLUGIN)
 	install -Dm644 -t $(DATADIR) assets/display.svg
 	@echo "installed to $(PREFIX)/$(PLUGIN) + icon in $(DATADIR)"
 
+test_display: tests/test_display.c src/display.c $(WBCOMMON)/wbcommon.h
+	$(CC) $(CFLAGS) -o $@ tests/test_display.c $(LDLIBS)
+
+test: test_display
+	./test_display
+
 clean:
-	rm -f $(PLUGIN)
-.PHONY: install clean
+	rm -f $(PLUGIN) test_display
+.PHONY: install clean test
