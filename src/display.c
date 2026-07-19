@@ -985,6 +985,7 @@ void *wbcffi_init(const wbcffi_init_info *info, const wbcffi_config_entry *entri
   g_signal_connect(self->bar_area, "draw", G_CALLBACK(bar_draw), self);
   gtk_container_add(GTK_CONTAINER(self->box), self->bar_area);
   wbpop_init(&self->pop, self->box, rebuild_cb, self);
+  wbpop_enable_geom_dump(&self->pop, "display");
   g_signal_connect(self->box, "button-press-event", G_CALLBACK(on_click), self);
   gtk_container_add(root, self->box);
   gtk_widget_show_all(GTK_WIDGET(root));
