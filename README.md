@@ -27,6 +27,8 @@ the live output. HDR toggle and SDR luminance apply live without a reload.
 Uses [waybar-plugin-common](https://github.com/asteroidzman/waybar-plugin-common)
 (git submodule at `common/`).
 
+Arch Linux: `yay -S waybar-display` (AUR).
+
 ```sh
 git clone --recursive https://github.com/asteroidzman/waybar-display.git
 cd waybar-display && make install
