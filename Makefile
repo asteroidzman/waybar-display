@@ -6,14 +6,15 @@ CFLAGS  += -fPIC -I$(WBCOMMON) $(shell pkg-config --cflags $(PKGS))
 LDLIBS  += $(shell pkg-config --libs $(PKGS)) -lm
 PREFIX  ?= $(HOME)/.local/lib/waybar
 DATADIR ?= $(HOME)/.local/share/waybar-display
+DESTDIR ?=
 
 $(PLUGIN): src/display.c $(WBCOMMON)/wbcommon.h
 	$(CC) $(CFLAGS) -shared -o $@ $< $(LDLIBS)
 
 install: $(PLUGIN)
-	install -Dm755 $(PLUGIN) $(PREFIX)/$(PLUGIN)
-	install -Dm644 -t $(DATADIR) assets/display.svg
-	@echo "installed to $(PREFIX)/$(PLUGIN) + icon in $(DATADIR)"
+	install -Dm755 $(PLUGIN) $(DESTDIR)$(PREFIX)/$(PLUGIN)
+	install -Dm644 -t $(DESTDIR)$(DATADIR) assets/display.svg
+	@echo "installed to $(DESTDIR)$(PREFIX)/$(PLUGIN) + icon in $(DESTDIR)$(DATADIR)"
 
 test_display: tests/test_display.c src/display.c $(WBCOMMON)/wbcommon.h
 	$(CC) $(CFLAGS) -o $@ tests/test_display.c $(LDLIBS)
