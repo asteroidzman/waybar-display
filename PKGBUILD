@@ -11,6 +11,11 @@ makedepends=('pkgconf' 'git')
 source=("git+$url.git#tag=$pkgver")
 sha256sums=('SKIP')
 
+prepare() {
+  cd "$pkgname"
+  git submodule update --init --recursive
+}
+
 build() {
   cd "$pkgname"
   make
