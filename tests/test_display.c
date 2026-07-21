@@ -111,6 +111,138 @@ int main(void) {
 
 	g_object_unref(fp);
 
+	// ── fmt_refresh: must not collapse a fractional mode onto a neighbour ──
+	// 59.94 and 60.000 are separately-listed real modes 0.06 Hz apart, so any
+	// rounding tolerance here silently changes which one a reload selects.
+	char rb[32];
+	fmt_refresh(60000, rb, sizeof rb);
+	CHECK_STR(rb, "60", "fmt_refresh writes a whole-Hz mode as a bare integer");
+	fmt_refresh(59940, rb, sizeof rb);
+	CHECK_STR(rb, "59.940", "fmt_refresh keeps 59.94 fractional rather than rounding to 60");
+	fmt_refresh(59951, rb, sizeof rb);
+	CHECK_STR(rb, "59.951", "fmt_refresh keeps a mode within 0.05Hz of an integer fractional");
+	fmt_refresh(143999, rb, sizeof rb);
+	CHECK_STR(rb, "143.999", "fmt_refresh keeps 143.999 distinct from 144");
+	fmt_refresh(144000, rb, sizeof rb);
+	CHECK_STR(rb, "144", "fmt_refresh writes 144.000 as a bare integer");
+
+	// ── pick_refresh_index: closest match, not last-within-tolerance ──
+	// Real HDMI-A-1 1920x1080 mode list, in the order the driver reports it:
+	// two separate 60.000 entries, with the 59.940 entry after both.
+	GArray *md = g_array_new(FALSE, FALSE, sizeof(Mode));
+	Mode modes_fixture[] = {
+		{1920, 1080,  60000}, {1920, 1080, 100000}, {1920, 1080, 74973},
+		{1920, 1080,  60000}, {1920, 1080,  59940}, {1920, 1080, 50000},
+		{1280,  720,  60000},
+	};
+	for (size_t i = 0; i < sizeof modes_fixture / sizeof modes_fixture[0]; i++)
+		g_array_append_val(md, modes_fixture[i]);
+
+	CHECK(pick_refresh_index(md, 1920, 1080, 1920, 1080, 59940) == 4,
+		"pick_refresh_index picks the exact 59.940 entry, not a 60.000 within 0.1Hz");
+	CHECK(pick_refresh_index(md, 1920, 1080, 1920, 1080, 60000) == 0,
+		"pick_refresh_index picks the FIRST 60.000 entry on a tie, not the later duplicate");
+	CHECK(pick_refresh_index(md, 1920, 1080, 1920, 1080, 74973) == 2,
+		"pick_refresh_index picks an exact non-60 match");
+	CHECK(pick_refresh_index(md, 1920, 1080, 1920, 1080, 59000) == 4,
+		"pick_refresh_index picks the nearest entry when nothing matches exactly");
+	CHECK(pick_refresh_index(md, 1920, 1080, 1280, 720, 60000) == 1,
+		"pick_refresh_index falls back to the highest refresh when changing resolution");
+	CHECK(pick_refresh_index(md, 800, 600, 1920, 1080, 60000) == -1,
+		"pick_refresh_index returns -1 for a resolution with no modes");
+
+	// Reversing the list must not change the answer -- the old code landed on
+	// the right entry only because the exact match happened to come last.
+	GArray *rev = g_array_new(FALSE, FALSE, sizeof(Mode));
+	for (int i = (int)(sizeof modes_fixture / sizeof modes_fixture[0]) - 1; i >= 0; i--)
+		g_array_append_val(rev, modes_fixture[i]);
+	Mode picked = g_array_index(rev, Mode, pick_refresh_index(rev, 1920, 1080, 1920, 1080, 59940));
+	CHECK(picked.refresh_mhz == 59940,
+		"pick_refresh_index still finds 59.940 when the driver reports modes in the opposite order");
+	g_array_free(md, TRUE);
+	g_array_free(rev, TRUE);
+
+	// ── comment preservation ──
+	// A hand-written note above an output block records WHY it is configured
+	// that way; losing it on rewrite makes the setting look arbitrary.
+	char *tmpf = NULL;
+	gint tmpfd = g_file_open_tmp("wbdisp-XXXXXX.kdl", &tmpf, NULL);
+	CHECK(tmpfd >= 0, "test can create a temp monitors.kdl");
+	close(tmpfd);
+	const char *sample =
+		KDL_HEADER_1 "\n"
+		KDL_HEADER_2 "\n"
+		"// 59.94, not 60, deliberately: matching DP-1 lets mclk switch.\n"
+		"// That trips a DCN 3.2 bug -- RGB snow mid-screen.\n"
+		"output HDMI-A-1 { scale 0.75; refresh 59.94; }\n"
+		"output DP-1 { scale 1; refresh 60; }\n";
+	g_file_set_contents(tmpf, sample, -1, NULL);
+
+	char *cmts = NULL;
+	char *line = find_existing_output_line(tmpf, "HDMI-A-1", &cmts);
+	CHECK(line != NULL, "find_existing_output_line finds the HDMI-A-1 block");
+	CHECK(line && strstr(line, "59.94") != NULL, "the preserved line keeps its 59.94 refresh");
+	CHECK(cmts && strstr(cmts, "DCN 3.2") != NULL,
+		"the comment lines directly above the block are returned with it");
+	CHECK(cmts && strstr(cmts, "Managed by") == NULL,
+		"the generated header is NOT returned as an attached comment (it would duplicate each write)");
+	g_free(line); g_free(cmts);
+
+	line = find_existing_output_line(tmpf, "DP-1", &cmts);
+	CHECK(line != NULL, "find_existing_output_line finds the DP-1 block");
+	CHECK(cmts && *cmts == '\0',
+		"a block with no comment above it gets an empty string, not the previous block's comment");
+	g_free(line); g_free(cmts);
+
+	line = find_existing_output_line(tmpf, "DP", &cmts);
+	CHECK(line == NULL, "find_existing_output_line does not prefix-match a shorter output name");
+	g_free(line); g_free(cmts);
+
+	// ── write_monitors_kdl end-to-end ──
+	// The real scenario: the user opens the dialog on HDMI-A-1, changes only
+	// the scale, and hits Apply. HDMI-A-1's block is regenerated from its
+	// sel_* fields while DP-1's is carried over verbatim -- and neither the
+	// deliberate 59.94 nor the comment explaining it may be lost.
+	Inst w = {0};
+	w.monitors_kdl = tmpf;
+	w.mons = g_array_new(FALSE, TRUE, sizeof(Mon));
+	Mon wm[2] = {0};
+	g_strlcpy(wm[0].name, "HDMI-A-1", sizeof wm[0].name);
+	wm[0].sel_w = 1920; wm[0].sel_h = 1080; wm[0].sel_mhz = 59940;
+	wm[0].sel_scale = 0.75; wm[0].sel_x = 3840; wm[0].sel_y = 0;
+	g_strlcpy(wm[1].name, "DP-1", sizeof wm[1].name);
+	wm[1].sel_w = 3840; wm[1].sel_h = 2160; wm[1].sel_mhz = 60000;
+	wm[1].sel_scale = 1.0;
+	g_array_append_vals(w.mons, wm, 2);
+
+	write_monitors_kdl(&w, "HDMI-A-1");
+
+	char *after = NULL;
+	g_file_get_contents(tmpf, &after, NULL, NULL);
+	CHECK(after && strstr(after, "refresh 59.940") != NULL,
+		"after an Apply on HDMI-A-1 its refresh is still 59.940, not rounded to 60");
+	CHECK(after && strstr(after, "DCN 3.2") != NULL,
+		"after an Apply the comment explaining the 59.94 survives");
+	CHECK(after && strstr(after, "output DP-1 { scale 1; refresh 60; }") != NULL,
+		"the untouched DP-1 block is carried over verbatim");
+	// The header must appear exactly once -- attaching it as a comment would
+	// make the file grow by two lines on every single Apply.
+	int hdr_count = 0;
+	for (const char *p = after; (p = strstr(p, "Managed by")); p++) hdr_count++;
+	CHECK(hdr_count == 1, "the generated header appears exactly once, not duplicated per write");
+
+	// A second Apply must be a fixed point, not accumulate anything.
+	write_monitors_kdl(&w, "HDMI-A-1");
+	char *after2 = NULL;
+	g_file_get_contents(tmpf, &after2, NULL, NULL);
+	CHECK(after && after2 && strcmp(after, after2) == 0,
+		"a second Apply with unchanged values reproduces the file byte-for-byte");
+	g_free(after); g_free(after2);
+	g_array_free(w.mons, TRUE);
+
+	g_unlink(tmpf);
+	g_free(tmpf);
+
 	printf("----\n%d failure(s)\n", failures);
 	return failures ? 1 : 0;
 }

@@ -243,32 +243,65 @@ static void update_bar(Inst *self) {
 }
 
 // ─── monitors.kdl writer (all monitors) ──────────────────────────────────────
+// Round to a bare integer ONLY when the mode really is a whole number of Hz.
+// A tolerance here is lossy in a way that matters: 59.94 and 60.000 are both
+// real, separately-listed modes on the same output, and collapsing one onto
+// the other silently changes which mode gets set on the next reload. That is
+// not cosmetic -- HDMI-A-1 is deliberately kept off 60.000, because matching
+// DP-1's timings lets the memory clock switch and that trips a DCN 3.2 bug
+// (dcn32_program_compbuf_size REG_WAIT timeout) which paints a band of RGB
+// snow across the middle of the screen.
 static void fmt_refresh(int mhz, char *buf, size_t n) {
-  double hz = mhz / 1000.0;
-  if (fabs(hz - lround(hz)) < 0.05) g_snprintf(buf, n, "%ld", lround(hz));
-  else g_snprintf(buf, n, "%.3f", hz);
+  if (mhz % 1000 == 0) g_snprintf(buf, n, "%d", mhz / 1000);
+  else g_snprintf(buf, n, "%.3f", mhz / 1000.0);
 }
+#define KDL_HEADER_1 "// Managed by the waybar-display plugin — rewritten on each change."
+#define KDL_HEADER_2 "// One `output` block per monitor; reload_config applies live."
+
 // Find the existing "output NAME { ... }" line for `name` in the file already
-// on disk, verbatim (including its trailing newline if any), or NULL if the
-// file doesn't exist / has no such line yet. Matches the exact output-name
-// token (not a prefix -- "DP-1" must not match "DP-10").
-static char *find_existing_output_line(const char *path, const char *name) {
+// on disk, verbatim, or NULL if the file doesn't exist / has no such line yet.
+// Matches the exact output-name token (not a prefix -- "DP-1" must not match
+// "DP-10").
+//
+// With `comments_out`, also returns the run of comment lines sitting directly
+// above that block (newline-terminated, "" when there are none). Those are
+// treated as belonging to the block and are re-emitted above it on rewrite,
+// so a hand-written note explaining WHY an output is configured a certain way
+// survives -- otherwise the reason is lost on the next Apply and the setting
+// looks arbitrary to whoever reads the file later. Only directly-attached
+// comments are kept; a free-floating comment elsewhere in the file is still
+// dropped. The generated header is excluded, or it would be re-attached to
+// the first block and duplicated on every write.
+static char *find_existing_output_line(const char *path, const char *name,
+                                       char **comments_out) {
+  if (comments_out) *comments_out = NULL;
   char *contents = NULL;
   if (!g_file_get_contents(path, &contents, NULL, NULL)) return NULL;
   char *result = NULL;
+  GString *pending = g_string_new(NULL);
   char **lines = g_strsplit(contents, "\n", -1);
   for (int i = 0; lines[i]; i++) {
     const char *l = lines[i];
-    if (!g_str_has_prefix(l, "output ")) continue;
+    if (g_str_has_prefix(l, "//")) {
+      if (strcmp(l, KDL_HEADER_1) != 0 && strcmp(l, KDL_HEADER_2) != 0) {
+        g_string_append(pending, l);
+        g_string_append_c(pending, '\n');
+      }
+      continue;
+    }
+    if (!g_str_has_prefix(l, "output ")) { g_string_truncate(pending, 0); continue; }
     const char *tok = l + 7;
     while (*tok == ' ') tok++;
     size_t tlen = 0;
     while (tok[tlen] && tok[tlen] != ' ' && tok[tlen] != '{') tlen++;
     if (tlen == strlen(name) && strncmp(tok, name, tlen) == 0) {
       result = g_strdup(l);
+      if (comments_out) *comments_out = g_strdup(pending->str);
       break;
     }
+    g_string_truncate(pending, 0);
   }
+  g_string_free(pending, TRUE);
   g_strfreev(lines);
   g_free(contents);
   return result;
@@ -284,22 +317,24 @@ static char *find_existing_output_line(const char *path, const char *name) {
 // real 144Hz) that then gets permanently baked into the config -- surviving
 // even a reboot, since nothing ever corrects it back once written.
 static void write_monitors_kdl(Inst *self, const char *edited_name) {
-  GString *s = g_string_new(
-      "// Managed by the waybar-display plugin — rewritten on each change.\n"
-      "// One `output` block per monitor; reload_config applies live.\n");
+  GString *s = g_string_new(KDL_HEADER_1 "\n" KDL_HEADER_2 "\n");
   for (guint i = 0; i < self->mons->len; i++) {
     Mon *m = &g_array_index(self->mons, Mon, i);
-    if (edited_name && strcmp(m->name, edited_name) != 0) {
-      char *existing = find_existing_output_line(self->monitors_kdl, m->name);
-      if (existing) {
-        g_string_append(s, existing);
-        g_string_append_c(s, '\n');
-        g_free(existing);
-        continue;
-      }
-      // no prior on-disk entry for this monitor (newly connected) -- fall
-      // through and generate one from its current live state, same as before
+    char *comments = NULL;
+    char *existing = find_existing_output_line(self->monitors_kdl, m->name, &comments);
+    // Attached comments are carried forward whether or not this is the block
+    // being edited -- the note explains the output, not one particular value.
+    if (comments && *comments) g_string_append(s, comments);
+    g_free(comments);
+    if (edited_name && strcmp(m->name, edited_name) != 0 && existing) {
+      g_string_append(s, existing);
+      g_string_append_c(s, '\n');
+      g_free(existing);
+      continue;
     }
+    // either this is the edited monitor, or there's no prior on-disk entry
+    // (newly connected) -- generate the block from its current live state
+    g_free(existing);
     g_string_append_printf(s, "output %s {", m->name);
     if (m->sel_hdr) g_string_append(s, " hdr;");
     g_string_append_printf(s, " scale %.4g;", m->sel_scale);
@@ -521,6 +556,38 @@ static void on_posxy_changed(GtkSpinButton *sp, gpointer d) {
   m->sel_y = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(self->w_posy));
   gtk_widget_queue_draw(self->canvas);
 }
+// Which entry of `modes` the refresh combo should land on for resolution
+// rw x rh, given the currently selected mode. Returns an index into `modes`,
+// or -1 if the resolution has no modes at all.
+//
+// Picks the CLOSEST match, not merely the last one inside a tolerance. An
+// output can list 60.000 and 59.940 at the same resolution and they are only
+// 0.06 Hz apart -- any tolerance loose enough to absorb rounding also
+// swallows that gap. The previous `abs(diff) < 100` test matched both and
+// landed on the right one only because the exact match happened to come later
+// in the driver's mode list; a reordered list would have silently retuned the
+// output. That matters here: HDMI-A-1 is deliberately held at 59.94 to stop
+// the memory clock switching, which trips a DCN 3.2 bug that paints RGB snow
+// across mid-screen.
+//
+// Ties keep the earlier entry (the driver's preferred mode). With no current
+// selection at this resolution, falls back to the highest refresh available.
+static int pick_refresh_index(GArray *modes, int rw, int rh,
+                              int sel_w, int sel_h, int sel_mhz) {
+  int best = -1, best_mhz = -1;
+  int match = -1, match_diff = 0;
+  for (guint i = 0; i < modes->len; i++) {
+    Mode md = g_array_index(modes, Mode, i);
+    if (md.w != rw || md.h != rh) continue;
+    if (md.refresh_mhz > best_mhz) { best_mhz = md.refresh_mhz; best = (int)i; }
+    if (rw == sel_w && rh == sel_h) {
+      int diff = abs(md.refresh_mhz - sel_mhz);
+      if (match < 0 || diff < match_diff) { match = (int)i; match_diff = diff; }
+    }
+  }
+  return match >= 0 ? match : best;
+}
+
 static void on_res_changed(GtkComboBox *c, gpointer d) {
   Inst *self = d; Mon *m = cur_mon(self);
   if (self->loading || !m || !self->w_refresh) return;
@@ -528,7 +595,6 @@ static void on_res_changed(GtkComboBox *c, gpointer d) {
   if (!res) return;
   int rw = 0, rh = 0; sscanf(res, "%dx%d", &rw, &rh);
   gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(self->w_refresh));
-  int best = -1; double best_hz = -1; int chose = 0;
   for (guint i = 0; i < m->modes->len; i++) {
     Mode md = g_array_index(m->modes, Mode, i);
     if (md.w != rw || md.h != rh) continue;
@@ -537,13 +603,10 @@ static void on_res_changed(GtkComboBox *c, gpointer d) {
     fmt_refresh(md.refresh_mhz, rb, sizeof rb);
     g_snprintf(lbl, sizeof lbl, "%s Hz", rb);
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(self->w_refresh), id, lbl);
-    if (md.refresh_mhz / 1000.0 > best_hz) { best_hz = md.refresh_mhz / 1000.0; best = i; }
-    if (rw == m->sel_w && rh == m->sel_h && abs(md.refresh_mhz - m->sel_mhz) < 100) {
-      gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_refresh), id); chose = 1;
-    }
   }
-  if (!chose && best >= 0) {
-    char cid[16]; g_snprintf(cid, sizeof cid, "%d", best);
+  int chosen = pick_refresh_index(m->modes, rw, rh, m->sel_w, m->sel_h, m->sel_mhz);
+  if (chosen >= 0) {
+    char cid[16]; g_snprintf(cid, sizeof cid, "%d", chosen);
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(self->w_refresh), cid);
   }
 }
