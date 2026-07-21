@@ -835,7 +835,88 @@ static int is_image(const char *name) {
   const char *dot = strrchr(name, '.');
   if (!dot) return 0;
   return !g_ascii_strcasecmp(dot, ".jpg") || !g_ascii_strcasecmp(dot, ".jpeg") ||
-         !g_ascii_strcasecmp(dot, ".png") || !g_ascii_strcasecmp(dot, ".webp");
+         !g_ascii_strcasecmp(dot, ".png") || !g_ascii_strcasecmp(dot, ".webp") ||
+         !g_ascii_strcasecmp(dot, ".avif") || !g_ascii_strcasecmp(dot, ".jxl");
+}
+
+// CICP transfer characteristic from an AVIF/HEIF 'colr' box, or -1.
+//
+// This scans the file header for the box signature rather than walking the
+// ISOBMFF tree, and deliberately does not pull in libavif: we need exactly one
+// 2-byte field to decide whether a thumbnail needs tone mapping, and a hard
+// dependency for a cosmetic decision is a bad trade. A miss costs an
+// un-tone-mapped thumbnail, nothing worse.
+//
+// colr box layout: size(4) 'colr'(4) colour_type(4) then, for 'nclx',
+// primaries(2) transfer(2) matrix(2) — so transfer sits 10 bytes past 'colr'.
+//
+// A file may carry more than one colr box: an ICC profile ('prof') as well as
+// the CICP one ('nclx'). Requiring 'nclx' skips the ICC box rather than
+// reading its bytes as colour codes. The scan window has to be generous —
+// measured on a real 8K HDR AVIF the nclx box sits at offset 13810, well past
+// the 8 KB a header-sized read would cover, because the ICC profile comes
+// first and is itself several KB.
+#define CICP_TF_PQ  16
+#define CICP_TF_HLG 18
+#define CICP_SCAN_BYTES (64 * 1024)
+static int image_transfer_characteristics(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  unsigned char *buf = g_malloc(CICP_SCAN_BYTES);
+  size_t n = fread(buf, 1, CICP_SCAN_BYTES, f);
+  fclose(f);
+  int tf = -1;
+  for (size_t i = 0; n >= 12 && i + 12 <= n; i++) {
+    if (memcmp(buf + i, "colr", 4) == 0 && memcmp(buf + i + 4, "nclx", 4) == 0) {
+      tf = (buf[i + 10] << 8) | buf[i + 11];
+      break;
+    }
+  }
+  g_free(buf);
+  return tf;
+}
+
+// Tone-map a PQ-encoded pixbuf down to something sensible for a thumbnail.
+//
+// gdk-pixbuf decodes an HDR AVIF but hands back the PQ code values as if they
+// were sRGB. Shown directly they read flat and washed out: PQ puts diffuse
+// white around code 0.58 and 1 nit near 0.15, so the whole picture collapses
+// into the middle of the range with nothing near black or white. Applying the
+// real ST.2084 EOTF and normalising to a 203-nit reference white (ITU-R
+// BT.2408) puts it back where the eye expects it.
+//
+// Working on the already-decoded 8-bit data loses precision in the deep
+// shadows, where PQ packs 0-1 nit into ~38 codes. For a 132x74 thumbnail that
+// is not worth a second full-precision decode path.
+static void pq_pixbuf_to_srgb(GdkPixbuf *pb) {
+  static guchar lut[256];
+  static gboolean lut_ready = FALSE;
+  if (!lut_ready) {
+    const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;
+    const double c1 = 3424.0 / 4096.0, c2 = 2413.0 / 4096.0 * 32.0,
+                 c3 = 2392.0 / 4096.0 * 32.0;
+    for (int i = 0; i < 256; i++) {
+      double p = pow(i / 255.0, 1.0 / m2);
+      double num = p - c1; if (num < 0) num = 0;
+      double lin = pow(num / (c2 - c3 * p), 1.0 / m1);      // 0..1 of 10000 nits
+      double s = lin * 10000.0 / 203.0;                      // to reference white
+      if (s > 1.0) s = 1.0;
+      double e = s <= 0.0031308 ? 12.92 * s : 1.055 * pow(s, 1.0 / 2.4) - 0.055;
+      int v = (int)(e * 255.0 + 0.5);
+      lut[i] = (guchar)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+    lut_ready = TRUE;
+  }
+  int w = gdk_pixbuf_get_width(pb), h = gdk_pixbuf_get_height(pb);
+  int nch = gdk_pixbuf_get_n_channels(pb), stride = gdk_pixbuf_get_rowstride(pb);
+  guchar *px = gdk_pixbuf_get_pixels(pb);
+  for (int y = 0; y < h; y++) {
+    guchar *row = px + (size_t)y * stride;
+    for (int x = 0; x < w; x++) {
+      guchar *p = row + (size_t)x * nch;
+      p[0] = lut[p[0]]; p[1] = lut[p[1]]; p[2] = lut[p[2]];   // alpha untouched
+    }
+  }
 }
 static gint cmp_names(gconstpointer a, gconstpointer b) {
   return g_ascii_strcasecmp(*(const char *const *)a, *(const char *const *)b);
@@ -856,6 +937,10 @@ static GdkPixbuf *thumb_pixbuf(const char *path) {
   if (!pb) {
     pb = gdk_pixbuf_new_from_file_at_scale(path, 132, 74, TRUE, NULL);
     if (pb) {
+      // Tone map BEFORE caching, so the correction is paid once per image
+      // rather than on every popup open.
+      int tf = image_transfer_characteristics(path);
+      if (tf == CICP_TF_PQ) pq_pixbuf_to_srgb(pb);
       g_mkdir_with_parents(cdir, 0755);
       gdk_pixbuf_save(pb, cache, "png", NULL, NULL);
     }

@@ -243,6 +243,68 @@ int main(void) {
 	g_unlink(tmpf);
 	g_free(tmpf);
 
+
+	// ── avif/jxl support in the wallpaper browser ──
+	CHECK(is_image("a.avif") && is_image("A.AVIF"), "is_image accepts .avif (case-insensitive)");
+	CHECK(is_image("a.jxl"), "is_image accepts .jxl");
+	CHECK(is_image("a.jpg") && is_image("a.png") && is_image("a.webp"),
+		"is_image still accepts the original SDR formats");
+	CHECK(!is_image("a.txt") && !is_image("noextension"), "is_image rejects non-images");
+
+	// CICP transfer parsed from the real files in ~/Pictures, when present.
+	// These assert only if the file exists, so the suite stays runnable
+	// anywhere; the parser itself is pinned by the synthetic case below.
+	// The 8K file is the important one: it carries an ICC 'prof' colr box
+	// BEFORE the 'nclx' one, pushing the CICP data to offset ~13810.
+	const char *pq_files[] = {
+		"/home/ralf/Pictures/20260314-cascade_0853_wp169.avif",
+		"/home/ralf/Pictures/GiauPass-synthhdr.avif",
+	};
+	for (size_t i = 0; i < 2; i++) {
+		if (!g_file_test(pq_files[i], G_FILE_TEST_EXISTS)) continue;
+		CHECK(image_transfer_characteristics(pq_files[i]) == CICP_TF_PQ,
+			"image_transfer_characteristics reads PQ (16) from a real HDR10 AVIF");
+	}
+
+	// An ICC 'prof' colr box must be skipped, not read as colour codes.
+	char *pf = NULL;
+	gint pfd = g_file_open_tmp("wbdisp-prof-XXXXXX.bin", &pf, NULL);
+	close(pfd);
+	const unsigned char twobox[] = {
+		0x00,0x00,0x00,0x0c, 'c','o','l','r', 'p','r','o','f',
+		0xde,0xad,0xbe,0xef,
+		0x00,0x00,0x00,0x13, 'c','o','l','r', 'n','c','l','x',
+		0x00,0x09, 0x00,0x10, 0x00,0x09, 0x80 };
+	FILE *pbf = fopen(pf, "wb"); fwrite(twobox, 1, sizeof twobox, pbf); fclose(pbf);
+	CHECK(image_transfer_characteristics(pf) == 16,
+		"image_transfer_characteristics skips an ICC 'prof' colr box and finds the nclx one");
+	g_unlink(pf); g_free(pf);
+
+	char *cf = NULL;
+	gint cfd = g_file_open_tmp("wbdisp-colr-XXXXXX.bin", &cf, NULL);
+	CHECK(cfd >= 0, "test can create a temp file for the colr parser");
+	close(cfd);
+	// minimal 'colr'/'nclx' box: primaries=9 transfer=16 matrix=9
+	const unsigned char box[] = {
+		0x00,0x00,0x00,0x13, 'c','o','l','r', 'n','c','l','x',
+		0x00,0x09, 0x00,0x10, 0x00,0x09, 0x80 };
+	unsigned char pad[64] = {0};
+	FILE *bf = fopen(cf, "wb");
+	fwrite(pad, 1, sizeof pad, bf); fwrite(box, 1, sizeof box, bf); fclose(bf);
+	CHECK(image_transfer_characteristics(cf) == 16,
+		"image_transfer_characteristics finds a colr/nclx box past a header");
+	g_unlink(cf); g_free(cf);
+
+	char *nf = NULL;
+	gint nfd = g_file_open_tmp("wbdisp-nocolr-XXXXXX.bin", &nf, NULL);
+	close(nfd);
+	g_file_set_contents(nf, "not an avif at all", -1, NULL);
+	CHECK(image_transfer_characteristics(nf) == -1,
+		"image_transfer_characteristics returns -1 when there is no colr box");
+	CHECK(image_transfer_characteristics("/nonexistent/xx.avif") == -1,
+		"image_transfer_characteristics returns -1 for an unreadable file");
+	g_unlink(nf); g_free(nf);
+
 	printf("----\n%d failure(s)\n", failures);
 	return failures ? 1 : 0;
 }
